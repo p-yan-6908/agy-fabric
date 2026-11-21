@@ -94,7 +94,7 @@ cp "$SCRIPT_DIR/README.md" "$PLUGIN_DIR/README.md"
 cp "$SCRIPT_DIR/agents/fabric.md" "$PLUGIN_DIR/agents/fabric.md"
 cp "$SCRIPT_DIR/assets/logo.svg" "$PLUGIN_DIR/assets/logo.svg"
 cp "$SCRIPT_DIR/server/"*.mjs "$PLUGIN_DIR/server/"
-chmod +x "$PLUGIN_DIR/server/mcp-server.mjs" "$PLUGIN_DIR/server/hook-cwd.mjs"
+chmod +x "$PLUGIN_DIR/server/mcp-server.mjs" "$PLUGIN_DIR/server/hook-cwd.mjs" "$PLUGIN_DIR/server/tui-proxy.mjs"
 
 # Write resolved absolute bun + plugin paths so Antigravity launches hooks and MCP
 # reliably even when ~/.bun/bin is not in the GUI/non-login PATH.

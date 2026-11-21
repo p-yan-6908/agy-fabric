@@ -64,7 +64,21 @@ if [ -n "$tel_cwd" ] && [ -s "${tel_cwd}/.pi/fabric/compaction/pending.json" ]; 
   pending_tok="$(jq -r '.estimatedTokensAfter // empty' "${tel_cwd}/.pi/fabric/compaction/pending.json" 2>/dev/null)"
 fi
 
-jq -r --slurpfile prev "$state_file" --arg ptok "$pending_tok" '
+fabric_runs_file="${fabric_dir}/sessions/runs-${PPID:-0}.json"
+fabric_badge=""
+if [ -s "$fabric_runs_file" ]; then
+  fabric_badge="$(jq -r '
+    if .active != null then
+      "run:" + (.active.name // "fabric")
+    elif ((.totals.runs // 0) > 0) then
+      "done:" + ((.totals.runs // 0) | tostring) + ":" + ((.totals.ops // 0) | tostring) + ":" + ((.totals.errors // 0) | tostring)
+    else
+      ""
+    end
+  ' "$fabric_runs_file" 2>/dev/null || true)"
+fi
+
+jq -r --slurpfile prev "$state_file" --arg ptok "$pending_tok" --arg fbadge "$fabric_badge" '
   def ansi($code; $s): "\u001b[" + $code + "m" + $s + "\u001b[0m";
   def dim($s): ansi("2"; $s);
   def bold($s): ansi("1"; $s);
@@ -179,6 +193,22 @@ jq -r --slurpfile prev "$state_file" --arg ptok "$pending_tok" '
    end) as $qw_str |
   ("quota " + $q5_str + " " + $qw_str) as $quota_seg |
 
+  # 6. Optional Fabric live activity badge (when fabric_exec has run in this session)
+  (if ($fbadge | startswith("run:")) then
+     yellow("⚡ " + ($fbadge | sub("^run:"; "")))
+   elif ($fbadge | startswith("done:")) then
+     (($fbadge | sub("^done:"; "") | split(":")) as $fp |
+      ($fp[0] | tonumber) as $fruns |
+      ($fp[1] | tonumber) as $fops |
+      ($fp[2] | tonumber) as $ferr |
+      cyan("⚡ " + ($fruns | tostring) + "r") + dim("·" + ($fops | tostring) + "op") +
+        (if $ferr > 0 then " " + red("✗" + ($ferr | tostring)) else "" end))
+   else
+     ""
+   end) as $fabric_seg |
+
   dim(" │ ") as $sep |
-  [magenta($model_label), $ctx_seg, $tok_seg, $cache_seg, $quota_seg] | join($sep)
+  ([magenta($model_label), $ctx_seg, $tok_seg, $cache_seg, $quota_seg] +
+    (if ($fabric_seg | length) > 0 then [$fabric_seg] else [] end)
+  ) | join($sep)
 ' <<< "$input" 2>/dev/null

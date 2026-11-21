@@ -23,8 +23,13 @@ Instead of burning round-trips on individual file-read, grep, edit, and shell to
   - Concurrent terminal sessions are isolated per `agy` PID.
 - **Parallel `agy` Subagents (`agents.run`)**
   - Spawn nested `agy` subagents directly from TypeScript (fan out with `Promise.all`), inheriting your active `agy` model by default or configurable via `FABRIC_SUBAGENT_MODEL` / `fabric.json`.
+- **Clean TUI Visuals (`server/tui-proxy.mjs` + `server/run-tracker.mjs`)**
+  - Replaces raw `Called N MCP tools (fabric_fabric/fabric_exec ×N)` rows, generic `Calling MCP tool...` spinners, and wrapped JSON dumps in `ctrl+o` with live Fabric program names, descriptions, op breakdowns, and durations:
+    - Collapsed: `⚡ Fabric · 12 runs  ✓ Read ×14 · Edit ×4 · Bash ×3 · 8.2s  (ctrl+o)`
+    - Expanded (`ctrl+o`): `│ ✓ read_pkg · Read ×1 · 11ms` + indented description & op summary
+  - Automatically bypassed in non-TTY / `-p` print mode, or opt out anytime with `agyf --plain` / `AGYF_PLAIN=1`.
 - **Optional Live Telemetry Statusline (`scripts/statusline.sh`)**
-  - Displays model, git branch/dirty state, session token totals, cache hit %, and context usage bar — and feeds live token telemetry into `compact.pressure()`.
+  - Displays model, context %, session tokens, cache hit %, quota, and live Fabric run/op badge (`⚡ 2r·2op`) — and feeds live token telemetry into `compact.pressure()`.
 
 ---
 
@@ -67,8 +72,11 @@ To uninstall:
 ## Usage
 
 ```bash
-# Start an interactive Fabric Code Mode session (equivalent to: agy --agent fabric)
+# Start an interactive Fabric Code Mode session (with clean TUI visuals)
 agyf
+
+# Start without the visual PTY compositor (raw agy output)
+agyf --plain
 
 # One-shot prompt mode
 agyf -p="Sketch this repository with Fovea and summarize its entrypoints"
@@ -173,6 +181,9 @@ This both renders the live statusline and writes per-session context telemetry t
 │   ├── kernel.mjs        # Warm sandboxed guest TypeScript kernel
 │   ├── compactor.mjs     # Deterministic 0-LLM transcript compactor
 │   ├── hook-cwd.mjs      # Lifecycle hook handler (PID-isolated session tracking)
+│   ├── run-tracker.mjs   # PID-isolated live run/op telemetry snapshots
+│   ├── tui-proxy.mjs     # Zero-flicker PTY visual compositor for agyf
+│   ├── vt-screen.mjs     # Lightweight VT100 shadow screen tracker
 │   ├── budget.mjs        # Output clipping helpers
 │   └── resolve-deps.mjs  # Portable package resolver for pi-* dependencies
 ├── bin/

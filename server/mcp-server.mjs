@@ -36,6 +36,7 @@ import {
   updateCarryItems,
 } from './compactor.mjs'
 import { importFile, resolvePackageFile } from './resolve-deps.mjs'
+import { createRunTracker } from './run-tracker.mjs'
 
 // Keep stdout exclusively for MCP JSON-RPC frames even when extensions log
 console.log = (...args) => console.error(...args)
@@ -179,6 +180,7 @@ const resolveOwnerAgyPid = () => {
 }
 
 const OWNER_AGY_PID = resolveOwnerAgyPid()
+const runTracker = createRunTracker({ tmpRoot: TMP_ROOT, sessionsDir: SESSIONS_DIR, getOwnerPid: () => OWNER_AGY_PID })
 let mcpRoots = []
 
 const readActiveSessionMeta = () => {
@@ -1468,6 +1470,7 @@ const executeFabricProgram = async rawInput => {
   const skillsList = discoverSkills(cwd).map(({ name, description, source }) => ({ name, description, source }))
   const worker = await acquireWorker(cwd)
 
+  const runHandle = runTracker.startRun({ id, cwd, code, display: record(input.display) })
   const served = []
   const pending = new Set()
   const stray = []
@@ -1526,6 +1529,7 @@ const executeFabricProgram = async rawInput => {
             : call.op === 'compact'
               ? `compact.${call.args?.action}`
               : call.op
+    const callEntry = runTracker.startCall(runHandle, call.op, call.args, cwd)
     let answer
     try {
       const value = await dispatchHostCall(call.op, call.args)
@@ -1533,6 +1537,7 @@ const executeFabricProgram = async rawInput => {
     } catch (err) {
       answer = { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
+    runTracker.finishCall(runHandle, callEntry, answer.ok)
     if (call.op !== 'state') served.push({ ref, isOk: answer.ok })
     try {
       if (worker.alive) worker.send({ t: 'res', id: call.id, answer })
@@ -1629,6 +1634,7 @@ const executeFabricProgram = async rawInput => {
     ? `${wholeValue}${wholeValue === '' ? allPrinted.trimStart() : allPrinted}` || '(the program returned nothing)'
     : `fabric_exec error: ${failure}\n${before}${allPrinted}`
 
+  runTracker.finishRun(runHandle, { ok: isOk, error: isOk ? null : failure, preview: isOk ? wholeValue.slice(0, 120) : '' })
   const wholeBytes = Buffer.byteLength(whole, 'utf8')
 
   // 1. Hand whole result to pi-context-engineer (handles >=16 KB offloads, >=4 KB error compaction, turn budgets)
