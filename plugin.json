@@ -1,0 +1,21 @@
+{
+  "name": "fabric",
+  "displayName": "Fabric Code Mode",
+  "version": "1.0.0",
+  "description": "Pi Fabric full code mode for Antigravity: one sandboxed fabric_exec TypeScript tool composing file, shell, search, Fovea code-graph navigation, Context Engineer offloading, deterministic 0-LLM compaction, MCP, skills, and agy subagents.",
+  "author": {
+    "name": "p-yan-6908",
+    "url": "https://github.com/p-yan-6908"
+  },
+  "homepage": "https://github.com/p-yan-6908/agy-fabric",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/p-yan-6908/agy-fabric.git"
+  },
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Inspect this repository's structure and summarize its entrypoints",
+    "Run tests in code mode and fix any failing assertions",
+    "Fan out parallel subagents to audit modules and synthesize findings"
+  ]
+}

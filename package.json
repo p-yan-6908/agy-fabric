@@ -1,0 +1,18 @@
+{
+  "name": "agy-fabric",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Full code mode for Antigravity (agy): Pi Fabric sandboxed TypeScript kernel, Pi Fovea code-graph navigation, Pi Context Engineer offloading, and deterministic 0-LLM compaction.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/p-yan-6908/agy-fabric.git"
+  },
+  "homepage": "https://github.com/p-yan-6908/agy-fabric#readme",
+  "dependencies": {
+    "pi-context-engineer": "^0.10.0",
+    "pi-fabric": "^0.139.0",
+    "pi-fovea": "^0.33.2"
+  }
+}

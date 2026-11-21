@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "fabric": {
+      "command": "bun",
+      "args": [
+        "./server/mcp-server.mjs"
+      ]
+    }
+  }
+}

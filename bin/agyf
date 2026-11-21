@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+find_agy() {
+  if [ -n "${AGY_BIN:-}" ] && [ -x "${AGY_BIN}" ]; then
+    printf '%s\n' "${AGY_BIN}"
+    return 0
+  fi
+  if command -v agy >/dev/null 2>&1; then
+    command -v agy
+    return 0
+  fi
+  for candidate in "$HOME/.local/bin/agy" "/opt/homebrew/bin/agy" "/usr/local/bin/agy"; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+AGY_PATH="$(find_agy)" || {
+  echo "agyf: could not find 'agy' binary in PATH or ~/.local/bin/agy" >&2
+  exit 1
+}
+
+exec "$AGY_PATH" --agent fabric "$@"

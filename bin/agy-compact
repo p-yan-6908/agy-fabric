@@ -1,0 +1,147 @@
+#!/usr/bin/env bun
+// CLI helper for Pi Fabric's deterministic (0-LLM) algorithmic compaction in agy.
+// Usage:
+//   agy-compact                       # compact latest conversation & launch fresh `agy --agent fabric`
+//   agy-compact "Keep auth bug notes" # custom focus instructions
+//   agy-compact --stage-only          # stage pending.json without launching agy (next `/new` picks it up)
+//   agy-compact --status              # show current carry-forward & staged/committed compaction status
+//   agy-compact --carry "item"        # add a persistent [Carry Forward] item
+//   agy-compact --cancel              # clear pending staged compaction
+
+import { spawnSync } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+const HOME = homedir()
+const BIN_DIR = dirname(fileURLToPath(import.meta.url))
+
+const resolveCompactorPath = () => {
+  const candidates = [
+    process.env.AGY_FABRIC_PLUGIN_DIR ? join(process.env.AGY_FABRIC_PLUGIN_DIR, 'server', 'compactor.mjs') : null,
+    join(dirname(BIN_DIR), 'server', 'compactor.mjs'),
+    join(HOME, '.gemini', 'config', 'plugins', 'fabric', 'server', 'compactor.mjs'),
+  ]
+  for (const c of candidates) {
+    if (c && existsSync(c)) return c
+  }
+  return null
+}
+
+const resolveAgyBin = () => {
+  const candidates = [
+    process.env.AGY_BIN || null,
+    join(HOME, '.local', 'bin', 'agy'),
+    '/opt/homebrew/bin/agy',
+    '/usr/local/bin/agy',
+  ]
+  for (const c of candidates) {
+    if (c && existsSync(c)) return c
+  }
+  return 'agy'
+}
+
+const compactorPath = resolveCompactorPath()
+if (!compactorPath) {
+  console.error(
+    'agy-compact: could not locate fabric plugin compactor.mjs. Install agy-fabric or set AGY_FABRIC_PLUGIN_DIR.',
+  )
+  process.exit(1)
+}
+
+const {
+  cancelPendingCompaction,
+  compileTranscriptCompaction,
+  readCompactionStatus,
+  updateCarryItems,
+} = await import(pathToFileURL(compactorPath).href)
+
+const cwd = process.cwd()
+const args = process.argv.slice(2)
+
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(`Usage: agy-compact [options] [custom instructions]
+
+Deterministic LLM-free session compactor for Antigravity (powered by pi-fabric).
+
+Options:
+  --stage-only        Compile and stage compaction for next /new without launching agy
+  --status            Print current carry-forward items and compaction status
+  --carry "<item>"    Add a persistent [Carry Forward] focus item
+  --clear-carry       Clear all [Carry Forward] items
+  --cancel            Cancel a pending staged compaction
+  -h, --help          Show this help`)
+  process.exit(0)
+}
+
+if (args.includes('--status')) {
+  console.log(JSON.stringify(readCompactionStatus(cwd), null, 2))
+  process.exit(0)
+}
+
+if (args.includes('--cancel')) {
+  console.log(JSON.stringify(cancelPendingCompaction(cwd), null, 2))
+  process.exit(0)
+}
+
+if (args.includes('--clear-carry')) {
+  console.log(JSON.stringify(updateCarryItems(cwd, { clear: true }), null, 2))
+  process.exit(0)
+}
+
+const carryIdx = args.indexOf('--carry')
+if (carryIdx >= 0) {
+  const item = args[carryIdx + 1]
+  if (!item) {
+    console.error('Error: --carry requires a non-empty string')
+    process.exit(1)
+  }
+  console.log(JSON.stringify(updateCarryItems(cwd, { add: [item] }), null, 2))
+  process.exit(0)
+}
+
+const stageOnly = args.includes('--stage-only')
+const instructions = args.filter(a => !a.startsWith('--')).join(' ').trim()
+
+const uid = process.getuid ? process.getuid() : 501
+let convId = null
+let transcriptPath = null
+try {
+  const metaPath = `/tmp/agy-fabric-${uid}/active-cwd.json`
+  if (existsSync(metaPath)) {
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+    if (meta.cwd === cwd) {
+      convId = meta.conversationId ?? null
+      transcriptPath = meta.transcriptPath ?? null
+    }
+  }
+} catch {}
+
+try {
+  const pkt = compileTranscriptCompaction({
+    cwd,
+    conversationId: convId,
+    transcriptPath,
+    instructions,
+    reason: 'agy-compact CLI',
+    requestedBy: 'user',
+  })
+  console.log(
+    `⚡ Fabric deterministic compaction staged (0 LLM tokens):\n` +
+      `   Source entries: ${pkt.counts?.branchEntries ?? 0} (${pkt.omittedCounts?.thinking ?? 0} thinking blocks stripped)\n` +
+      `   First kept tail entry: ${pkt.firstKeptEntryId || '(compact-all)'}\n` +
+      `   Summary size: ${(pkt.summaryBytes / 1024).toFixed(1)} KB (~${pkt.estimatedTokensAfter} total injected tokens)\n` +
+      `   Saved to: ${cwd}/.pi/fabric/compaction/pending.json`,
+  )
+  if (stageOnly) {
+    console.log('   Run `/new` inside agy or `agyf` in terminal to start with this compacted context.')
+    process.exit(0)
+  }
+  const agyBin = resolveAgyBin()
+  const res = spawnSync(agyBin, ['--agent', 'fabric'], { stdio: 'inherit', cwd })
+  process.exit(res.status ?? 0)
+} catch (err) {
+  console.error(`agy-compact failed: ${err instanceof Error ? err.message : String(err)}`)
+  process.exit(1)
+}

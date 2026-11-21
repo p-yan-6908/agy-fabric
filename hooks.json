@@ -1,0 +1,37 @@
+{
+  "fabric-lifecycle": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "bun ./server/hook-cwd.mjs",
+        "timeout": 10
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "bun ./server/hook-cwd.mjs",
+        "timeout": 15
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*fabric.*|mcp.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun ./server/hook-cwd.mjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "bun ./server/hook-cwd.mjs",
+        "timeout": 10
+      }
+    ]
+  }
+}
