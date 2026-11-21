@@ -540,7 +540,7 @@ let pendingChunks = []
 let flushTimer = null
 let agyPid = null
 
-const flushOutput = () => {
+const flushOutput = (finalFlush = false) => {
   if (flushTimer) {
     clearTimeout(flushTimer)
     flushTimer = null
@@ -549,16 +549,76 @@ const flushOutput = () => {
   const raw = pendingChunks.join('')
   pendingChunks = []
   screen.feed(raw)
+
+  // Never flush a truncated ANSI escape sequence to stdout, or a subsequent
+  // SYNC_START/patch could split the sequence and print raw CSI text on screen.
+  let outRaw = raw
+  if (!finalFlush && screen.pending && raw.endsWith(screen.pending)) {
+    const rem = screen.pending
+    screen.pending = ''
+    outRaw = raw.slice(0, raw.length - rem.length)
+    pendingChunks.unshift(rem)
+  }
+  if (!outRaw) return
+
   const snapshot = readRunsSnapshot(agyPid, sessionStartedAt)
   const nextOverlays = computeOverlays(screen, snapshot)
   const patch = buildRelativePatch(screen, overlaidRows, nextOverlays, false)
   overlaidRows = new Set(nextOverlays.keys())
   if (patch) {
-    process.stdout.write(SYNC_START + raw + patch + SYNC_END)
+    // Strip inner synchronized-update toggles so raw + patch render in one atomic frame
+    const cleanRaw = outRaw.replace(/\x1b\[\?2026[hl]/g, '')
+    process.stdout.write(SYNC_START + cleanRaw + patch + SYNC_END)
   } else {
-    process.stdout.write(raw)
+    process.stdout.write(outRaw)
   }
 }
+
+// Configure outer TTY to true raw mode (including -opost) BEFORE spawning agy.
+// Node/Bun's setRawMode(true) leaves OPOST/ONLCR enabled, which turns agy's raw
+// LF (\n) cursor-down moves into CRLF (\r\n) and corrupts relative positioning.
+const ttyIsInteractive = Boolean(process.stdin.isTTY)
+const wasRaw = Boolean(process.stdin.isRaw)
+let savedStty = ''
+let ttyRestored = false
+
+if (ttyIsInteractive) {
+  try {
+    const r = Bun.spawnSync(['stty', '-g'], { stdin: 'inherit', stdout: 'pipe', stderr: 'ignore' })
+    if (r.exitCode === 0) savedStty = r.stdout.toString().trim()
+  } catch {}
+}
+
+const applyRawTty = () => {
+  if (!ttyIsInteractive) return
+  ttyRestored = false
+  try {
+    process.stdin.setRawMode(true)
+  } catch {}
+  try {
+    Bun.spawnSync(['stty', '-opost'], { stdin: 'inherit', stdout: 'ignore', stderr: 'ignore' })
+  } catch {}
+}
+
+const restoreTty = () => {
+  if (!ttyIsInteractive || ttyRestored) return
+  ttyRestored = true
+  try {
+    process.stdin.setRawMode(wasRaw)
+  } catch {}
+  if (savedStty) {
+    try {
+      Bun.spawnSync(['stty', savedStty], { stdin: 'inherit', stdout: 'ignore', stderr: 'ignore' })
+    } catch {}
+  } else {
+    try {
+      Bun.spawnSync(['stty', 'opost', 'echo', 'icanon'], { stdin: 'inherit', stdout: 'ignore', stderr: 'ignore' })
+    } catch {}
+  }
+}
+
+applyRawTty()
+process.on('exit', restoreTty)
 
 const proc = Bun.spawn([agyBin, ...agyArgs], {
   cwd: process.cwd(),
@@ -570,7 +630,14 @@ const proc = Bun.spawn([agyBin, ...agyArgs], {
       const s = typeof data === 'string' ? data : decoder.write(Buffer.from(data))
       if (!s) return
       pendingChunks.push(s)
-      if (s.includes('\x1b[?25h')) {
+      if (
+        s.includes('\x1b[?25h') ||
+        s.includes('\x1b[?2026l') ||
+        s.includes('$p') ||
+        s.includes('?\x07') ||
+        s.includes('\x1b[?u') ||
+        s.includes('\x1b[6n')
+      ) {
         flushOutput()
       } else if (!flushTimer) {
         flushTimer = setTimeout(flushOutput, 12)
@@ -594,10 +661,6 @@ const liveTicker = setInterval(() => {
 liveTicker.unref?.()
 
 // Forward raw stdin to PTY
-const wasRaw = Boolean(process.stdin.isRaw)
-try {
-  if (process.stdin.isTTY) process.stdin.setRawMode(true)
-} catch {}
 process.stdin.resume()
 const onStdinData = chunk => {
   try {
@@ -625,16 +688,18 @@ const onSignal = sig => {
 }
 process.on('SIGTERM', () => onSignal('SIGTERM'))
 process.on('SIGHUP', () => onSignal('SIGHUP'))
+process.on('SIGCONT', () => {
+  applyRawTty()
+  onResize()
+})
 
 const exitCode = await proc.exited
 clearInterval(liveTicker)
 const tail = decoder.end()
 if (tail) pendingChunks.push(tail)
-flushOutput()
+flushOutput(true)
 process.stdin.off('data', onStdinData)
 process.stdout.off('resize', onResize)
-try {
-  if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw)
-} catch {}
+restoreTty()
 process.stdin.pause()
 process.exit(exitCode ?? 0)

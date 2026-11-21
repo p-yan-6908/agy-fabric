@@ -156,7 +156,9 @@ export class VtScreen {
   }
 
   handleCsi(paramsStr, finalByte) {
-    const isPriv = paramsStr.startsWith('?') || paramsStr.startsWith('>') || paramsStr.startsWith('=')
+    const isPriv = /^[?<>=]/.test(paramsStr)
+    const hasInterm = /[ !"#$%&'()*+,\-./]/.test(paramsStr)
+    if (hasInterm) return
     const clean = isPriv ? paramsStr.slice(1) : paramsStr
     const nums = clean ? clean.split(';').map(s => (s === '' ? 0 : Number(s))) : []
     const p1 = nums[0] || 0
@@ -204,7 +206,7 @@ export class VtScreen {
         this.col = Math.min(this.cols - 1, this.col + (p1 || 1))
         break
       case 'D':
-        this.col = Math.max(0, this.col - (p1 || 1))
+        this.col = Math.max(0, Math.min(this.cols - 1, this.col) - (p1 || 1))
         break
       case 'E':
         this.row = Math.min(this.rows - 1, this.row + (p1 || 1))
