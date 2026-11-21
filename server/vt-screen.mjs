@@ -37,7 +37,7 @@ export const charWidth = ch => {
   const cp = ch.codePointAt(0)
   if (cp === undefined || cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0
   if (isCombiningCodePoint(cp)) return 0
-  if (cp === 0x26a1) return 2 // ⚡ lightning bolt renders 2 cols in modern terminals
+  if (cp === 0x26a1) return 2 // wide high-voltage symbol
   return isWideCodePoint(cp) ? 2 : 1
 }
 

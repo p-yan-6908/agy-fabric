@@ -128,7 +128,7 @@ try {
     requestedBy: 'user',
   })
   console.log(
-    `⚡ Fabric deterministic compaction staged (0 LLM tokens):\n` +
+    `[fabric] Deterministic compaction staged (0 LLM tokens):\n` +
       `   Source entries: ${pkt.counts?.branchEntries ?? 0} (${pkt.omittedCounts?.thinking ?? 0} thinking blocks stripped)\n` +
       `   First kept tail entry: ${pkt.firstKeptEntryId || '(compact-all)'}\n` +
       `   Summary size: ${(pkt.summaryBytes / 1024).toFixed(1)} KB (~${pkt.estimatedTokensAfter} total injected tokens)\n` +

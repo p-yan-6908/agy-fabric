@@ -172,7 +172,7 @@ try {
             requestedBy: '/compact',
             stagePending: true,
           })
-          const summaryMsg = `⚡ Fabric Algorithmic Compaction staged (0 LLM tokens): summarized ${pkt.counts?.cumulativeSourceEntries ?? pkt.counts?.branchEntries ?? 0} entries (${pkt.omittedCounts?.thinking ?? 0} thinking blocks stripped) into ~${pkt.estimatedTokensAfter ?? 0} tokens. Run /new to continue in the compacted window.`
+          const summaryMsg = `[fabric] Algorithmic compaction staged (0 LLM tokens): summarized ${pkt.counts?.cumulativeSourceEntries ?? pkt.counts?.branchEntries ?? 0} entries (${pkt.omittedCounts?.thinking ?? 0} thinking blocks stripped) into ~${pkt.estimatedTokensAfter ?? 0} tokens. Run /new to continue in the compacted window.`
           responseObj = {
             injectSteps: [
               {

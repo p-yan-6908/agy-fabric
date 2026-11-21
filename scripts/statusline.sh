@@ -130,7 +130,7 @@ jq -r --slurpfile prev "$state_file" --arg ptok "$pending_tok" --arg fbadge "$fa
   ) as $ctx_pct |
   ("ctx " + fmt_pct1($ctx_pct)) as $ctx_plain |
   (color_high_bad($ctx_pct; $ctx_plain) +
-    (if ($ptok | length) > 0 then " " + cyan("⚡~" + fmt_tok($ptok | tonumber)) else "" end)
+    (if ($ptok | length) > 0 then " " + cyan("[~" + fmt_tok($ptok | tonumber) + "]") else "" end)
   ) as $ctx_seg |
 
   # 3. Session tokens used
@@ -166,19 +166,28 @@ jq -r --slurpfile prev "$state_file" --arg ptok "$pending_tok" --arg fbadge "$fa
    end) as $cache_seg |
 
   # 5. Quota (5h & weekly remaining % matched to active model family: gemini vs 3p)
-  def pick_quota($entries; $win_re; $fam_re):
-    ($entries | map(select(.key | test($win_re; "i")))) as $cand |
-    (($cand | map(select(.key | test($fam_re; "i"))) | .[0].value) // ($cand | .[0].value));
+  # Prefer exact canonical keys (<family>-5h, <family>-weekly) so model-specific
+  # sub-buckets (e.g. gemini-*-weekly) that sort earlier alphabetically never shadow the main quota.
+  def pick_quota($map; $exact_key; $win_re; $fam):
+    if ($map[$exact_key] != null) then
+      $map[$exact_key]
+    else
+      ($map | to_entries | map(select(.key | test($win_re; "i")))) as $cand |
+      (
+        ($cand | map(select(.key | test("^" + $fam + "[-_]|" + $fam; "i"))) | sort_by(.key | length) | .[0].value)
+        // ($cand | sort_by(.key | length) | .[0].value)
+      )
+    end;
 
   ((.model.id // "") + " " + (.model.display_name // "")) as $model_ident |
   (if ($model_ident | test("claude|sonnet|opus|haiku|gpt|openai|anthropic|3p"; "i")) then
-     "^3p[-_]|3p"
+     "3p"
    else
-     "^gemini[-_]|gemini"
-   end) as $qfam_re |
-  (.quota // {} | to_entries) as $qentries |
-  pick_quota($qentries; "5h|5hr|five|short"; $qfam_re) as $q5 |
-  pick_quota($qentries; "week|7d|wk"; $qfam_re) as $qw |
+     "gemini"
+   end) as $qfam |
+  (.quota // {}) as $qmap |
+  pick_quota($qmap; $qfam + "-5h"; "5h|5hr|five|short"; $qfam) as $q5 |
+  pick_quota($qmap; $qfam + "-weekly"; "week|7d|wk"; $qfam) as $qw |
   (if $q5 != null and ($q5.remaining_fraction != null) then
      (($q5.remaining_fraction * 100) | round) as $p5 |
      "5h:" + color_low_bad($p5; ($p5 | tostring) + "%")
@@ -195,13 +204,13 @@ jq -r --slurpfile prev "$state_file" --arg ptok "$pending_tok" --arg fbadge "$fa
 
   # 6. Optional Fabric live activity badge (when fabric_exec has run in this session)
   (if ($fbadge | startswith("run:")) then
-     yellow("⚡ " + ($fbadge | sub("^run:"; "")))
+     yellow("fabric " + ($fbadge | sub("^run:"; "")))
    elif ($fbadge | startswith("done:")) then
      (($fbadge | sub("^done:"; "") | split(":")) as $fp |
       ($fp[0] | tonumber) as $fruns |
       ($fp[1] | tonumber) as $fops |
       ($fp[2] | tonumber) as $ferr |
-      cyan("⚡ " + ($fruns | tostring) + "r") + dim("·" + ($fops | tostring) + "op") +
+      cyan("fabric " + ($fruns | tostring) + "r") + dim("·" + ($fops | tostring) + "op") +
         (if $ferr > 0 then " " + red("✗" + ($ferr | tostring)) else "" end))
    else
      ""

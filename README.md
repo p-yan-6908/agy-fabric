@@ -25,11 +25,11 @@ Instead of burning round-trips on individual file-read, grep, edit, and shell to
   - Spawn nested `agy` subagents directly from TypeScript (fan out with `Promise.all`), inheriting your active `agy` model by default or configurable via `FABRIC_SUBAGENT_MODEL` / `fabric.json`.
 - **Clean TUI Visuals (`server/tui-proxy.mjs` + `server/run-tracker.mjs`)**
   - Replaces raw `Called N MCP tools (fabric_fabric/fabric_exec ×N)` rows, generic `Calling MCP tool...` spinners, and wrapped JSON dumps in `ctrl+o` with live Fabric program names, descriptions, op breakdowns, and durations:
-    - Collapsed: `⚡ Fabric · 12 runs  ✓ Read ×14 · Edit ×4 · Bash ×3 · 8.2s  (ctrl+o)`
+    - Collapsed: `● Fabric · 12 runs  ✓ Read ×14 · Edit ×4 · Bash ×3 · 8.2s  (ctrl+o)`
     - Expanded (`ctrl+o`): `│ ✓ read_pkg · Read ×1 · 11ms` + indented description & op summary
   - Automatically bypassed in non-TTY / `-p` print mode, or opt out anytime with `agyf --plain` / `AGYF_PLAIN=1`.
 - **Optional Live Telemetry Statusline (`scripts/statusline.sh`)**
-  - Displays model, context %, session tokens, cache hit %, quota, and live Fabric run/op badge (`⚡ 2r·2op`) — and feeds live token telemetry into `compact.pressure()`.
+  - Displays model, context %, session tokens, cache hit %, quota, and live Fabric run/op badge (`fabric 2r·2op`) — and feeds live token telemetry into `compact.pressure()`.
 
 ---
 

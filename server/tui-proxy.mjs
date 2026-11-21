@@ -260,8 +260,12 @@ const computeOverlays = (screen, snapshot) => {
 
       const segs = []
       if (indent) segs.push({ text: indent })
-      if (expanded) segs.push({ ansi: MUTED, text: '▾ ' })
-      segs.push({ ansi: AMBER, text: '⚡ ' })
+      if (expanded) {
+        segs.push({ ansi: MUTED, text: '▾ ' })
+      } else {
+        const dotColor = info.isCalling ? YELLOW : errors > 0 ? RED : GREEN
+        segs.push({ ansi: dotColor, text: '● ' })
+      }
       segs.push({ ansi: BOLD + WHITE, text: 'Fabric' })
 
       if (info.isCalling) {
@@ -315,7 +319,7 @@ const computeOverlays = (screen, snapshot) => {
       const run = isCalling ? active : recent[recent.length - 1]
       const segs = [
         ...(indent ? [{ text: indent }] : []),
-        { ansi: AMBER, text: '⚡ ' },
+        { ansi: isCalling ? YELLOW : run?.ok === false ? RED : GREEN, text: '● ' },
         { ansi: BOLD + WHITE, text: 'Fabric' },
         { ansi: MUTED, text: ' · ' },
         { ansi: CYAN, text: run?.name || 'program' },
