@@ -8,7 +8,7 @@
 // inline terminal mode (at any starting row) and alternate-screen mode.
 // Bypass with --plain or AGYF_PLAIN=1 (or automatically when non-TTY / print mode).
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 
@@ -539,6 +539,37 @@ let overlaidRows = new Set()
 let pendingChunks = []
 let flushTimer = null
 let agyPid = null
+let autoNewTimer = null
+
+const checkAutoNewSignal = () => {
+  if (!agyPid || autoNewTimer) return
+  const sigFile = join(SESSIONS_DIR, `autonew-${agyPid}.json`)
+  if (!existsSync(sigFile)) return
+  let sig = null
+  try {
+    sig = JSON.parse(readFileSync(sigFile, 'utf8'))
+    unlinkSync(sigFile)
+  } catch {
+    try {
+      unlinkSync(sigFile)
+    } catch {}
+    return
+  }
+  if ((sig?.requestedAt || 0) < sessionStartedAt) return
+  autoNewTimer = setTimeout(() => {
+    try {
+      proc.terminal.write('/new')
+      setTimeout(() => {
+        try {
+          proc.terminal.write('\r')
+        } catch {}
+        autoNewTimer = null
+      }, 80)
+    } catch {
+      autoNewTimer = null
+    }
+  }, 220)
+}
 
 const flushOutput = (finalFlush = false) => {
   if (flushTimer) {
@@ -572,6 +603,7 @@ const flushOutput = (finalFlush = false) => {
   } else {
     process.stdout.write(outRaw)
   }
+  checkAutoNewSignal()
 }
 
 // Configure outer TTY to true raw mode (including -opost) BEFORE spawning agy.
@@ -648,8 +680,9 @@ const proc = Bun.spawn([agyBin, ...agyArgs], {
 
 agyPid = proc.pid
 
-// Live refresh ticker while a Fabric program is actively executing
+// Live refresh ticker while a Fabric program is actively executing (and auto-/new watcher)
 const liveTicker = setInterval(() => {
+  checkAutoNewSignal()
   if (overlaidRows.size === 0 || pendingChunks.length > 0) return
   const snapshot = readRunsSnapshot(agyPid, sessionStartedAt)
   if (!snapshot?.active) return

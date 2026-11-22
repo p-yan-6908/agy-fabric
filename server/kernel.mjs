@@ -337,7 +337,7 @@ if (!isWorkerMode) {
 } else {
   // --- Persistent Warm Worker Mode (`bun kernel.mjs --worker`) ---------------
   const pendingCalls = new Map()
-  const memState = new Map()
+  const memStateByDir = new Map()
   let nextId = 0
 
   const host = (op, args) =>
@@ -355,6 +355,9 @@ if (!isWorkerMode) {
         process.chdir(msg.cwd)
       } catch {}
     }
+    const stateNs = String(msg.stateDir || msg.cwd || 'default')
+    if (!memStateByDir.has(stateNs)) memStateByDir.set(stateNs, new Map())
+    const memState = memStateByDir.get(stateNs)
     const env = buildProgramEnv({ host, runMeta: msg, logs, memState })
     try {
       const program = await import(pathToFileURL(msg.programPath).href)

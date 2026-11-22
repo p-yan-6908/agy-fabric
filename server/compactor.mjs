@@ -98,13 +98,73 @@ const resolveExistingTranscript = candidatePath => {
   return null
 }
 
-export const findTranscriptForConversation = (conversationId, fallbackPath = null) => {
-  const direct = resolveExistingTranscript(fallbackPath)
+const TMP_ROOT = `/tmp/agy-fabric-${process.getuid ? process.getuid() : 501}`
+const SESSIONS_DIR = join(TMP_ROOT, 'sessions')
+const ACTIVE_CWD_FILE = join(TMP_ROOT, 'active-cwd.json')
+
+export const findSessionForCwd = cwd => {
+  if (!cwd) return null
+  const targetCwd = resolve(cwd)
+  const candidates = []
+  const pushCandidate = (meta, fallbackMtime = 0) => {
+    if (!meta || typeof meta !== 'object') return
+    const metaCwd = typeof meta.cwd === 'string' && meta.cwd ? resolve(meta.cwd) : null
+    if (metaCwd !== targetCwd) return
+    const conversationId = meta.conversationId ?? meta.session_id ?? null
+    const transcriptPath = meta.transcriptPath ?? meta.transcript_path ?? null
+    if (!conversationId && !transcriptPath) return
+    const updatedAt = Number(meta.updatedAt ?? meta.updated_at ?? fallbackMtime ?? 0)
+    candidates.push({ conversationId, transcriptPath, updatedAt })
+  }
+
+  pushCandidate(readJsonSafe(ACTIVE_CWD_FILE))
+  if (existsSync(SESSIONS_DIR)) {
+    for (const name of readdirSync(SESSIONS_DIR)) {
+      if (!/^(?:conv|pid|tel)-.*\.json$/.test(name)) continue
+      const fullPath = join(SESSIONS_DIR, name)
+      let mt = 0
+      try {
+        mt = statSync(fullPath).mtimeMs
+      } catch {}
+      pushCandidate(readJsonSafe(fullPath), mt)
+    }
+  }
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => b.updatedAt - a.updatedAt)
+  return candidates[0]
+}
+
+const collectForeignConversations = cwd => {
+  const foreign = new Set()
+  if (!cwd || !existsSync(SESSIONS_DIR)) return foreign
+  const targetCwd = resolve(cwd)
+  for (const name of readdirSync(SESSIONS_DIR)) {
+    if (!/^(?:conv|pid|tel)-.*\.json$/.test(name)) continue
+    const meta = readJsonSafe(join(SESSIONS_DIR, name))
+    if (!meta || typeof meta.cwd !== 'string' || !meta.cwd) continue
+    const id = meta.conversationId ?? meta.session_id ?? null
+    if (id && resolve(meta.cwd) !== targetCwd) foreign.add(String(id))
+  }
+  return foreign
+}
+
+export const findTranscriptForConversation = (conversationId, fallbackPath = null, cwd = null) => {
+  let convId = conversationId
+  let candidatePath = fallbackPath
+
+  if (!convId && !candidatePath && cwd) {
+    const matched = findSessionForCwd(cwd)
+    if (matched) {
+      convId = matched.conversationId ?? null
+      candidatePath = matched.transcriptPath ?? null
+    }
+  }
+
+  const direct = resolveExistingTranscript(candidatePath)
   if (direct) return direct
 
-  let convId = conversationId
-  if (!convId && typeof fallbackPath === 'string') {
-    const m = /\/brain\/([0-9a-f-]{36})\//i.exec(fallbackPath)
+  if (!convId && typeof candidatePath === 'string') {
+    const m = /\/brain\/([0-9a-f-]{36})\//i.exec(candidatePath)
     if (m) convId = m[1]
   }
 
@@ -116,12 +176,14 @@ export const findTranscriptForConversation = (conversationId, fallbackPath = nul
       if (existsSync(compact)) return compact
     }
   }
-  // Fallback: newest transcript_full.jsonl in brain
+  // Fallback: newest transcript_full.jsonl in brain not known to belong to a different workspace
+  const foreignIds = collectForeignConversations(cwd)
   let bestPath = null
   let bestMtime = 0
   for (const root of BRAIN_ROOTS) {
     if (!existsSync(root)) continue
     for (const id of readdirSync(root)) {
+      if (foreignIds.has(id)) continue
       const full = join(root, id, '.system_generated', 'logs', 'transcript_full.jsonl')
       if (!existsSync(full)) continue
       try {
@@ -317,7 +379,16 @@ export const compileTranscriptCompaction = ({
   stagePending = true,
   commitConversationId = null,
 }) => {
-  const resolvedTranscript = findTranscriptForConversation(conversationId, transcriptPath)
+  let effConvId = conversationId
+  let effTranscriptPath = transcriptPath
+  if (!effConvId && !effTranscriptPath && cwd) {
+    const byCwd = findSessionForCwd(cwd)
+    if (byCwd) {
+      effConvId = byCwd.conversationId ?? null
+      effTranscriptPath = byCwd.transcriptPath ?? null
+    }
+  }
+  const resolvedTranscript = findTranscriptForConversation(effConvId, effTranscriptPath, cwd)
   if (!resolvedTranscript) {
     throw new Error('compact: no active Antigravity transcript found to compact')
   }
@@ -387,7 +458,7 @@ export const compileTranscriptCompaction = ({
     instructions: instructions || null,
     preserve: Array.isArray(preserve) ? preserve : [],
     seed: seed ? String(seed) : null,
-    sourceConversationId: conversationId,
+    sourceConversationId: effConvId,
     sourceTranscriptPath: resolvedTranscript,
     tokensBeforeEstimate: rawTok,
     estimatedTokensAfter: Math.ceil(Buffer.byteLength(fullInjection, 'utf8') / 4),
@@ -484,7 +555,7 @@ export const expandTranscriptMemory = (cwd, options = {}, sessionMeta = {}) => {
   } else if (spawnedFromLast) {
     targetPath = lastPath
   } else {
-    targetPath = activeTranscript || lastPath || pendingPath || findTranscriptForConversation(null, null)
+    targetPath = activeTranscript || lastPath || pendingPath || findTranscriptForConversation(null, null, cwd)
   }
 
   if (!targetPath || !existsSync(targetPath)) {
@@ -533,15 +604,14 @@ export const expandTranscriptMemory = (cwd, options = {}, sessionMeta = {}) => {
   // By keyword query across exact raw steps
   const q = String(options.query ?? '').trim().toLowerCase()
   if (q) {
-    const matched = steps
-      .filter(s => {
-        const hay = `${stepBodyText(s)} ${JSON.stringify(s.tool_calls ?? '')}`.toLowerCase()
-        return hay.includes(q)
-      })
-      .slice(-limit)
+    const allMatched = steps.filter(s => {
+      const hay = `${stepBodyText(s)} ${JSON.stringify(s.tool_calls ?? '')}`.toLowerCase()
+      return hay.includes(q)
+    })
+    const matched = allMatched.slice(-limit)
     return {
       sourceTranscriptPath: targetPath,
-      totalMatchedSteps: matched.length,
+      totalMatchedSteps: allMatched.length,
       matches: matched.map(s => ({
         entryId: `step-${s.step_index}`,
         type: s.type,

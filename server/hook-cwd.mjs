@@ -9,7 +9,7 @@
 // - Stop: auto-stages deterministic compaction once context occupancy reaches 65%+.
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 import {
@@ -123,6 +123,12 @@ try {
   }
 
   if (eventName === 'SessionStart' && resolvedCwd) {
+    if (agyPid > 1) {
+      try {
+        const autoNewFile = `${sessionsDir}/autonew-${agyPid}.json`
+        if (existsSync(autoNewFile)) unlinkSync(autoNewFile)
+      } catch {}
+    }
     const cDir = compactionDir(resolvedCwd)
     const pendingPath = join(cDir, 'pending.json')
     const pkt = readJsonSafe(pendingPath)
@@ -154,7 +160,7 @@ try {
     if (invNum === 0) {
       let compactCmd = parseCompactSlashCommand(payload.lastUserInput ?? payload.last_user_input ?? '')
       if (!compactCmd) {
-        const tx = findTranscriptForConversation(resolvedConvId, resolvedTranscript)
+        const tx = findTranscriptForConversation(resolvedConvId, resolvedTranscript, resolvedCwd)
         const lastStep = readLastTranscriptStep(tx)
         if (lastStep && lastStep.type === 'USER_INPUT') {
           compactCmd = parseCompactSlashCommand(lastStep.content)
@@ -172,6 +178,14 @@ try {
             requestedBy: '/compact',
             stagePending: true,
           })
+          if (agyPid > 1) {
+            writeJsonAtomic(`${sessionsDir}/autonew-${agyPid}.json`, {
+              agyPid,
+              cwd: targetCwd,
+              conversationId: resolvedConvId,
+              requestedAt: Date.now(),
+            })
+          }
           const summaryMsg = `[fabric] Algorithmic compaction staged (0 LLM tokens): summarized ${pkt.counts?.cumulativeSourceEntries ?? pkt.counts?.branchEntries ?? 0} entries (${pkt.omittedCounts?.thinking ?? 0} thinking blocks stripped) into ~${pkt.estimatedTokensAfter ?? 0} tokens. Run /new to continue in the compacted window.`
           responseObj = {
             injectSteps: [

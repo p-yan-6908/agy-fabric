@@ -9,7 +9,7 @@
 //   agy-compact --cancel              # clear pending staged compaction
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -22,6 +22,17 @@ const resolveCompactorPath = () => {
     process.env.AGY_FABRIC_PLUGIN_DIR ? join(process.env.AGY_FABRIC_PLUGIN_DIR, 'server', 'compactor.mjs') : null,
     join(dirname(BIN_DIR), 'server', 'compactor.mjs'),
     join(HOME, '.gemini', 'config', 'plugins', 'fabric', 'server', 'compactor.mjs'),
+  ]
+  for (const c of candidates) {
+    if (c && existsSync(c)) return c
+  }
+  return null
+}
+
+const resolveAgyfBin = () => {
+  const candidates = [
+    join(BIN_DIR, 'agyf'),
+    join(HOME, '.local', 'bin', 'agyf'),
   ]
   for (const c of candidates) {
     if (c && existsSync(c)) return c
@@ -53,6 +64,7 @@ if (!compactorPath) {
 const {
   cancelPendingCompaction,
   compileTranscriptCompaction,
+  findSessionForCwd,
   readCompactionStatus,
   updateCarryItems,
 } = await import(pathToFileURL(compactorPath).href)
@@ -67,6 +79,7 @@ Deterministic LLM-free session compactor for Antigravity (powered by pi-fabric).
 
 Options:
   --stage-only        Compile and stage compaction for next /new without launching agy
+  --plain             Launch new session without the PTY visual compositor
   --status            Print current carry-forward items and compaction status
   --carry "<item>"    Add a persistent [Carry Forward] focus item
   --clear-carry       Clear all [Carry Forward] items
@@ -102,21 +115,12 @@ if (carryIdx >= 0) {
 }
 
 const stageOnly = args.includes('--stage-only')
+const plain = args.includes('--plain') || process.env.AGYF_PLAIN === '1'
 const instructions = args.filter(a => !a.startsWith('--')).join(' ').trim()
 
-const uid = process.getuid ? process.getuid() : 501
-let convId = null
-let transcriptPath = null
-try {
-  const metaPath = `/tmp/agy-fabric-${uid}/active-cwd.json`
-  if (existsSync(metaPath)) {
-    const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
-    if (meta.cwd === cwd) {
-      convId = meta.conversationId ?? null
-      transcriptPath = meta.transcriptPath ?? null
-    }
-  }
-} catch {}
+const matchedSession = findSessionForCwd(cwd)
+const convId = matchedSession?.conversationId ?? null
+const transcriptPath = matchedSession?.transcriptPath ?? null
 
 try {
   const pkt = compileTranscriptCompaction({
@@ -137,6 +141,11 @@ try {
   if (stageOnly) {
     console.log('   Run `/new` inside agy or `agyf` in terminal to start with this compacted context.')
     process.exit(0)
+  }
+  const agyfBin = resolveAgyfBin()
+  if (agyfBin) {
+    const res = spawnSync(agyfBin, plain ? ['--plain'] : [], { stdio: 'inherit', cwd })
+    process.exit(res.status ?? 0)
   }
   const agyBin = resolveAgyBin()
   const res = spawnSync(agyBin, ['--agent', 'fabric'], { stdio: 'inherit', cwd })

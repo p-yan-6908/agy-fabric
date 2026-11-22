@@ -56,16 +56,21 @@ const EXTRA_PATHS = [
 const FULL_PATH = [...EXTRA_PATHS, ...(process.env.PATH || '').split(':')].filter(Boolean).join(':')
 process.env.PATH = FULL_PATH
 
+const PATH_DIRS = FULL_PATH.split(':').filter(Boolean)
 const findBin = (name, fallbacks = []) => {
-  for (const candidate of [...fallbacks, ...EXTRA_PATHS.map(p => join(p, name)), `/usr/bin/${name}`, `/bin/${name}`]) {
-    if (candidate && existsSync(candidate)) return candidate
+  for (const candidate of [...fallbacks, ...PATH_DIRS.map(p => join(p, name)), `/usr/bin/${name}`, `/bin/${name}`]) {
+    if (candidate && isAbsolute(candidate) && existsSync(candidate)) return candidate
   }
   return name
 }
 
 const BUN_BIN = findBin('bun', [process.execPath])
 const RG_BIN = findBin('rg')
+const HAS_RG = isAbsolute(RG_BIN) && existsSync(RG_BIN)
+const GREP_BIN = findBin('grep', ['/usr/bin/grep', '/bin/grep'])
 const AGY_BIN = findBin('agy')
+const SHELL_BIN =
+  ['/bin/zsh', '/usr/bin/zsh', '/bin/bash', '/usr/bin/bash', '/bin/sh'].find(p => existsSync(p)) || '/bin/sh'
 const SANDBOX_EXEC = '/usr/bin/sandbox-exec'
 const HAS_SANDBOX = existsSync(SANDBOX_EXEC)
 const SANDBOX_PROFILE =
@@ -106,6 +111,80 @@ const readJsonSafe = path => {
   } catch {
     return null
   }
+}
+
+const PLUGIN_VERSION = readJsonSafe(join(PLUGIN_ROOT, 'plugin.json'))?.version || '1.0.0'
+
+const isPidAlive = pid => {
+  const n = Number(pid)
+  if (!Number.isFinite(n) || n <= 1) return false
+  try {
+    process.kill(n, 0)
+    return true
+  } catch (err) {
+    return err?.code !== 'ESRCH'
+  }
+}
+
+const pruneStaleTmpFiles = () => {
+  const now = Date.now()
+  const pidTtlMs = 3600 * 1000
+  const fileTtlMs = 48 * 3600 * 1000
+  try {
+    for (const name of readdirSync(SESSIONS_DIR)) {
+      const full = join(SESSIONS_DIR, name)
+      let mt = 0
+      try {
+        mt = statSync(full).mtimeMs
+      } catch {
+        continue
+      }
+      const pidMatch = /^(?:pid|runs|tel-pid|autonew)-(\d+)\.json$/.exec(name)
+      if (pidMatch) {
+        if (now - mt > pidTtlMs && !isPidAlive(Number(pidMatch[1]))) {
+          try {
+            unlinkSync(full)
+          } catch {}
+        }
+      } else if (now - mt > fileTtlMs) {
+        try {
+          unlinkSync(full)
+        } catch {}
+      }
+    }
+  } catch {}
+  try {
+    for (const name of readdirSync(SPILL_DIR)) {
+      const full = join(SPILL_DIR, name)
+      try {
+        if (now - statSync(full).mtimeMs > fileTtlMs) unlinkSync(full)
+      } catch {}
+    }
+  } catch {}
+  try {
+    for (const name of readdirSync(TMP_ROOT)) {
+      if (!name.startsWith('bg-') && !name.startsWith('run-')) continue
+      const full = join(TMP_ROOT, name)
+      const ttl = name.startsWith('run-') ? pidTtlMs : fileTtlMs
+      try {
+        if (now - statSync(full).mtimeMs > ttl) rmSync(full, { recursive: true, force: true })
+      } catch {}
+    }
+  } catch {}
+}
+pruneStaleTmpFiles()
+
+const workspaceStateDir = cwd => {
+  const full = resolve(cwd || HOME)
+  const base = full.split('/').filter(Boolean).pop() || 'root'
+  const safeBase = base.replace(/[^\w.-]/g, '_').slice(0, 32)
+  const hash =
+    typeof Bun !== 'undefined' && typeof Bun.hash === 'function'
+      ? Bun.hash(full).toString(36)
+      : Buffer.from(full).toString('base64url').slice(-16)
+  const dir = join(STATE_DIR, `${safeBase}-${hash}`)
+  mkdirSync(dir, { recursive: true })
+  return dir
 }
 
 const loadFabricConfig = cwd => {
@@ -691,24 +770,52 @@ const execPi = async (cwd, maxTimeoutMs, method, rawArgs) => {
         : { ...record(args[0]) }
     const pattern = firstKey(opts, ['pattern', 'query', 'regex', 'search', 'q', 'expression', 'text'])
     if (typeof pattern !== 'string') throw new Error('pi.grep: needs a pattern')
-    const rgArgs = ['-n', '--no-heading', '--color=never']
-    if (opts.ignoreCase) rgArgs.push('-i')
-    if (opts.literal) rgArgs.push('-F')
-    if (opts.context) rgArgs.push('-C', String(Math.max(0, Number(opts.context) || 0)))
-    if (opts.glob) rgArgs.push('-g', String(opts.glob))
-    rgArgs.push('-e', pattern)
     const where = firstKey(opts, PATH_KEYS)
-    if (where !== undefined) rgArgs.push('--', shownPath(cwd, where) === '.' ? '.' : absPath(cwd, where))
     const limit = Math.max(1, Number(opts.limit) || 100)
-    const ran = await runSubprocess(RG_BIN, rgArgs, { cwd, timeoutMs: 60000 })
+    if (HAS_RG) {
+      const rgArgs = ['-n', '--no-heading', '--color=never']
+      if (opts.ignoreCase) rgArgs.push('-i')
+      if (opts.literal) rgArgs.push('-F')
+      if (opts.context) rgArgs.push('-C', String(Math.max(0, Number(opts.context) || 0)))
+      if (opts.glob) rgArgs.push('-g', String(opts.glob))
+      rgArgs.push('-e', pattern)
+      if (where !== undefined) rgArgs.push('--', shownPath(cwd, where) === '.' ? '.' : absPath(cwd, where))
+      const ran = await runSubprocess(RG_BIN, rgArgs, { cwd, timeoutMs: 60000 })
+      if (ran.timedOut) throw new Error('pi.grep: timed out after 60s')
+      if (ran.exitCode === 1 && ran.stderr.trim() === '') return ''
+      if (ran.exitCode > 1) throw new Error(`pi.grep: ${ran.stderr.trim() || `rg exited with ${ran.exitCode}`}`)
+      const lines = ran.stdout.split('\n')
+      if (lines.at(-1) === '') lines.pop()
+      return lines
+        .slice(0, limit)
+        .map(line => (line.startsWith(`${cwd}/`) ? line.slice(cwd.length + 1) : line))
+        .join('\n')
+    }
+    const grepArgs = [
+      '-R',
+      '-n',
+      '-I',
+      '--color=never',
+      '--exclude-dir=.git',
+      '--exclude-dir=node_modules',
+      '--exclude-dir=.pi',
+    ]
+    if (opts.ignoreCase) grepArgs.push('-i')
+    if (opts.literal) grepArgs.push('-F')
+    else grepArgs.push('-E')
+    if (opts.context) grepArgs.push('-C', String(Math.max(0, Number(opts.context) || 0)))
+    if (opts.glob) grepArgs.push(`--include=${String(opts.glob)}`)
+    const target = where !== undefined ? (shownPath(cwd, where) === '.' ? '.' : absPath(cwd, where)) : '.'
+    grepArgs.push('-e', pattern, target)
+    const ran = await runSubprocess(GREP_BIN, grepArgs, { cwd, timeoutMs: 60000 })
     if (ran.timedOut) throw new Error('pi.grep: timed out after 60s')
     if (ran.exitCode === 1 && ran.stderr.trim() === '') return ''
-    if (ran.exitCode > 1) throw new Error(`pi.grep: ${ran.stderr.trim() || `rg exited with ${ran.exitCode}`}`)
+    if (ran.exitCode > 1) throw new Error(`pi.grep: ${ran.stderr.trim() || `grep exited with ${ran.exitCode}`}`)
     const lines = ran.stdout.split('\n')
     if (lines.at(-1) === '') lines.pop()
     return lines
       .slice(0, limit)
-      .map(line => (line.startsWith(`${cwd}/`) ? line.slice(cwd.length + 1) : line))
+      .map(line => (line.startsWith(`${cwd}/`) ? line.slice(cwd.length + 1) : line.replace(/^\.\//, '')))
       .join('\n')
   }
 
@@ -726,19 +833,31 @@ const execPi = async (cwd, maxTimeoutMs, method, rawArgs) => {
     const limit = Math.max(1, Number(opts.limit) || 200)
     const root = absPath(cwd, firstKey(opts, PATH_KEYS))
     if (!existsSync(root)) throw new Error(`pi.find: directory not found: ${shownPath(cwd, root)}`)
-    const ran = await runSubprocess(RG_BIN, ['--files', '--hidden', '-g', '!.git', '-g', pattern], {
-      cwd: root,
-      timeoutMs: 60000,
-    })
-    if (ran.timedOut) throw new Error('pi.find: timed out after 60s')
-    if (ran.exitCode === 1 && ran.stderr.trim() === '') return ''
-    if (ran.exitCode > 1) throw new Error(`pi.find: ${ran.stderr.trim() || `rg exited with ${ran.exitCode}`}`)
-    return ran.stdout
-      .split('\n')
-      .filter(Boolean)
-      .sort()
-      .slice(0, limit)
-      .join('\n')
+    if (HAS_RG) {
+      const ran = await runSubprocess(RG_BIN, ['--files', '--hidden', '-g', '!.git', '-g', pattern], {
+        cwd: root,
+        timeoutMs: 60000,
+      })
+      if (ran.timedOut) throw new Error('pi.find: timed out after 60s')
+      if (ran.exitCode === 1 && ran.stderr.trim() === '') return ''
+      if (ran.exitCode > 1) throw new Error(`pi.find: ${ran.stderr.trim() || `rg exited with ${ran.exitCode}`}`)
+      return ran.stdout
+        .split('\n')
+        .filter(Boolean)
+        .sort()
+        .slice(0, limit)
+        .join('\n')
+    }
+    const cleanPat = pattern.replace(/^\.\//, '')
+    const globExpr = cleanPat.includes('/') ? cleanPat : `**/${cleanPat}`
+    const includeNodeModules = cleanPat.includes('node_modules')
+    const matches = []
+    for (const rel of new Bun.Glob(globExpr).scanSync({ cwd: root, dot: true, onlyFiles: true })) {
+      if (rel === '.git' || rel.startsWith('.git/') || rel.includes('/.git/')) continue
+      if (!includeNodeModules && (rel.startsWith('node_modules/') || rel.includes('/node_modules/'))) continue
+      matches.push(rel)
+    }
+    return matches.sort().slice(0, limit).join('\n')
   }
 
   if (method === 'bash') {
@@ -750,7 +869,7 @@ const execPi = async (cwd, maxTimeoutMs, method, rawArgs) => {
     if (background) {
       const logPath = join(TMP_ROOT, `bg-${Date.now().toString(36)}-${++bgCounter}.log`)
       const outFd = openSync(logPath, 'a')
-      const child = spawn('/bin/zsh', ['-c', command], {
+      const child = spawn(SHELL_BIN, ['-c', command], {
         cwd: cmdCwd,
         env: { ...process.env, PATH: FULL_PATH },
         detached: true,
@@ -766,7 +885,7 @@ const execPi = async (cwd, maxTimeoutMs, method, rawArgs) => {
     }
     const seconds = Number(opts.timeout)
     const timeoutMs = Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, maxTimeoutMs) : Math.min(120000, maxTimeoutMs)
-    const ran = await runSubprocess('/bin/zsh', ['-c', command], { cwd: cmdCwd, timeoutMs })
+    const ran = await runSubprocess(SHELL_BIN, ['-c', command], { cwd: cmdCwd, timeoutMs })
     const combined = [ran.stdout, ran.stderr].filter(Boolean).join(ran.stdout && !ran.stdout.endsWith('\n') && ran.stderr ? '\n' : '')
     if (ran.timedOut) {
       const timeoutSec = Math.round(timeoutMs / 1000)
@@ -1042,6 +1161,21 @@ const connectStdioMcp = async (serverName, spec) => {
       } catch {}
     }
   })
+  const close = () => {
+    try {
+      child.stdin.end()
+    } catch {}
+    try {
+      child.kill('SIGTERM')
+    } catch {}
+  }
+
+  child.on('error', err => {
+    mcpClients.delete(serverName)
+    for (const { reject: rej } of pending.values()) rej(err)
+    pending.clear()
+  })
+
   child.on('close', () => {
     mcpClients.delete(serverName)
     for (const { reject: rej } of pending.values()) rej(new Error(`MCP server "${serverName}" closed`))
@@ -1065,17 +1199,30 @@ const connectStdioMcp = async (serverName, spec) => {
           rej(e)
         },
       })
-      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+      try {
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+      } catch (err) {
+        clearTimeout(t)
+        pending.delete(id)
+        rej(err)
+      }
     })
 
-  await rpc('initialize', {
-    protocolVersion: '2024-11-05',
-    capabilities: {},
-    clientInfo: { name: 'agy-fabric', version: '1.1.0' },
-  })
-  child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n')
+  try {
+    await rpc('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'agy-fabric', version: PLUGIN_VERSION },
+    })
+  } catch (err) {
+    close()
+    throw err
+  }
+  try {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n')
+  } catch {}
   const listed = await rpc('tools/list', {}).catch(() => ({ tools: [] }))
-  return { rpc, tools: Array.isArray(listed?.tools) ? listed.tools : [] }
+  return { rpc, tools: Array.isArray(listed?.tools) ? listed.tools : [], close }
 }
 
 const connectHttpMcp = async (serverName, spec) => {
@@ -1118,10 +1265,10 @@ const connectHttpMcp = async (serverName, spec) => {
   await rpc('initialize', {
     protocolVersion: '2025-03-26',
     capabilities: {},
-    clientInfo: { name: 'agy-fabric', version: '1.1.0' },
+    clientInfo: { name: 'agy-fabric', version: PLUGIN_VERSION },
   }).catch(() => undefined)
   const listed = await rpc('tools/list', {}).catch(() => ({ tools: [] }))
-  return { rpc, tools: Array.isArray(listed?.tools) ? listed.tools : [] }
+  return { rpc, tools: Array.isArray(listed?.tools) ? listed.tools : [], close: () => {} }
 }
 
 const getMcpClient = async serverName => {
@@ -1158,7 +1305,7 @@ const callExternalMcp = async ({ server, tool, args, settle }) => {
 
 const BUILTIN_CATALOG = [
   { ref: 'pi.read', kind: 'core', description: 'Read UTF-8 file text: (path, {offset?, limit?}) -> string' },
-  { ref: 'pi.bash', kind: 'core', description: 'Run zsh command: (command, {timeout? seconds, cwd?, settle?, background?}) -> {ok, output, details}' },
+  { ref: 'pi.bash', kind: 'core', description: 'Run shell command: (command, {timeout? seconds, cwd?, settle?, background?}) -> {ok, output, details}' },
   { ref: 'pi.grep', kind: 'core', description: 'Search contents via ripgrep: (pattern, path?, limit?) or {pattern, path?, glob?, ignoreCase?, literal?, context?, limit?} -> string' },
   { ref: 'pi.find', kind: 'core', description: 'Find files matching glob: (pattern, path?, limit?) -> string' },
   { ref: 'pi.ls', kind: 'core', description: 'List directory entries: (path?, {limit?}) -> string' },
@@ -1444,6 +1591,7 @@ const executeFabricProgram = async rawInput => {
   const sessionMeta = readActiveSessionMeta()
   const sessionId = sessionMeta.conversationId || 'agy-session'
   const cwd = resolveSessionCwd(input.cwd)
+  const stateDir = workspaceStateDir(cwd)
   const cfg = loadFabricConfig(cwd)
   const reqTimeout = Number(input.timeoutMs ?? input.timeout_ms)
   const timeoutMs = Number.isFinite(reqTimeout) && reqTimeout > 0 ? Math.min(reqTimeout, 600000) : cfg.timeoutMs
@@ -1504,7 +1652,7 @@ const executeFabricProgram = async rawInput => {
     }
     if (op === 'state') {
       const safe = String(args.key).replace(/[^\w.-]/g, '_').slice(0, 80)
-      const p = join(STATE_DIR, `${safe}.json`)
+      const p = join(stateDir, `${safe}.json`)
       if (args.action === 'set') {
         writeFileSync(p, JSON.stringify(args.value ?? null), 'utf8')
         return null
@@ -1589,7 +1737,7 @@ const executeFabricProgram = async rawInput => {
         payloads: parsePayloads(input.payloads ?? input.strings),
         skills: skillsList,
         agents: [{ name: 'fabric', ...(cfg.defaultSubagentModel ? { defaultModel: cfg.defaultSubagentModel } : {}) }],
-        stateDir: STATE_DIR,
+        stateDir,
         headerLines: PROGRAM_HEADER_LINES,
       })
     } catch (err) {
@@ -1794,6 +1942,12 @@ let clientSupportsRoots = false
 
 const shutdownAll = async () => {
   if (idleWorker) idleWorker.destroy()
+  for (const client of mcpClients.values()) {
+    try {
+      client.close?.()
+    } catch {}
+  }
+  mcpClients.clear()
   const jobs = []
   for (const { host } of ceHostsByCwd.values()) jobs.push(host.ops.shutdown().catch(() => undefined))
   for (const host of foveaHostsByCwd.values()) jobs.push(host.ops.shutdown().catch(() => undefined))
@@ -1833,7 +1987,7 @@ const handleRpcMessage = async msg => {
         result: {
           protocolVersion: params?.protocolVersion || '2024-11-05',
           capabilities: { tools: {} },
-          serverInfo: { name: 'fabric', version: '1.2.0' },
+          serverInfo: { name: 'fabric', version: PLUGIN_VERSION },
         },
       })
       return
