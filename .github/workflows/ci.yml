@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: JSON manifests parse
+        run: |
+          for f in plugin.json hooks.json mcp_config.json package.json; do
+            python3 -c "import json; json.load(open('$f'))" && echo "ok: $f"
+          done
+
+      - name: Shell scripts parse
+        run: |
+          bash -n install.sh uninstall.sh bin/agyf scripts/statusline.sh
+          echo "ok: shell scripts"
+
+      - name: Server entrypoints bundle-check
+        run: |
+          mkdir -p /tmp/agyf-build
+          for f in server/*.mjs; do
+            bun build "$f" --target bun --outdir /tmp/agyf-build >/dev/null && echo "ok: $f"
+          done

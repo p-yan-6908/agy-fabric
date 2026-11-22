@@ -9,6 +9,18 @@ SETTINGS_PATH="$HOME/.gemini/antigravity-cli/settings.json"
 WITH_STATUSLINE=0
 SKIP_DEPS=0
 
+# Bootstrap: when piped via `curl | bash` the repo files are not present, so
+# clone a shallow copy into a temp dir and re-run from there.
+if [ ! -f "$SCRIPT_DIR/plugin.json" ]; then
+  TMP_CLONE="$(mktemp -d)"
+  echo "==> Fetching agy-fabric..."
+  git clone --depth 1 https://github.com/p-yan-6908/agy-fabric.git "$TMP_CLONE/agy-fabric"
+  bash "$TMP_CLONE/agy-fabric/install.sh" "$@"
+  rc=$?
+  rm -rf "$TMP_CLONE"
+  exit $rc
+fi
+
 usage() {
   cat <<'EOF'
 Usage: ./install.sh [options]

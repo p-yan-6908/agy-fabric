@@ -1,10 +1,32 @@
+<div align="center">
+
+<img src="assets/logo.svg" alt="agy-fabric logo" width="80" />
+
 # agy-fabric (`agyf`)
 
-**Full Code Mode for Antigravity (`agy`)** — powered by [Pi Fabric](https://www.npmjs.com/package/pi-fabric), [Pi Fovea](https://www.npmjs.com/package/pi-fovea), and [Pi Context Engineer](https://github.com/p-yan-6908/pi-context-engineer).
+**Full Code Mode for Google Antigravity (`agy`)**
 
-Instead of burning round-trips on individual file-read, grep, edit, and shell tool calls, `agyf` runs Antigravity with a minimal system prompt and a single warm, sandboxed TypeScript execution tool (`fabric_exec`) that composes file I/O, shell commands, code-graph navigation, automatic context offloading, deterministic 0-LLM compaction, MCP servers, skills, and parallel `agy` subagents inside one program.
+[![Version](https://img.shields.io/badge/version-1.0.0-38BDF8?labelColor=0F172A&style=flat-square)](CHANGELOG.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-22C55E?labelColor=0F172A&style=flat-square)](LICENSE)
+[![Bun](https://img.shields.io/badge/bun-%3E%3D1.1-F9F1E1?labelColor=0F172A&style=flat-square&logo=bun&logoColor=FBF0DF)](https://bun.sh)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-64748B?labelColor=0F172A&style=flat-square)](#quick-start)
+[![Compaction](https://img.shields.io/badge/compaction-0--LLM-7C3AED?labelColor=0F172A&style=flat-square)](#features)
+[![CI](https://img.shields.io/github/actions/workflow/status/p-yan-6908/agy-fabric/ci.yml?branch=main&label=CI&style=flat-square&labelColor=0F172A)](https://github.com/p-yan-6908/agy-fabric/actions)
+
+One warm, sandboxed TypeScript kernel for everything — file I/O, shell, code-graph navigation,<br>
+context offloading, deterministic 0-LLM compaction, MCP, skills, and parallel `agy` subagents.
+
+[Quick Start](#quick-start) · [Benchmarks](#benchmarks) · [Changelog](CHANGELOG.md) · [fabric-swe results](https://p-yan-6908.github.io/fabric-swe/)
+
+</div>
 
 ---
+
+## Why `agy-fabric`?
+
+Stock agent loops spend a model round-trip on every `read_file`, `grep`, `edit`, and `run_command` — and dump every byte of every result into the context window. `agyf` instead runs Antigravity with a minimal system prompt and a **single** tool, `fabric_exec`: a persistent, sandboxed TypeScript kernel that composes file I/O, shell commands, code-graph navigation, context offloading, compaction, MCP servers, skills, and subagents inside one program. Intermediate data stays in the kernel; only the returned value reaches the model.
+
+Powered by [Pi Fabric](https://www.npmjs.com/package/pi-fabric), [Pi Fovea](https://www.npmjs.com/package/pi-fovea), and [Pi Context Engineer](https://github.com/p-yan-6908/pi-context-engineer).
 
 ## Features
 
@@ -41,7 +63,22 @@ Instead of burning round-trips on individual file-read, grep, edit, and shell to
 
 ---
 
-## Installation
+## Quick Start
+
+One-command install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/p-yan-6908/agy-fabric/main/install.sh | bash
+```
+
+Then start a Fabric Code Mode session:
+
+```bash
+agyf
+```
+
+<details>
+<summary><b>Install from a local clone</b></summary>
 
 ```bash
 git clone https://github.com/p-yan-6908/agy-fabric.git
@@ -54,6 +91,8 @@ To also install the live context telemetry statusline:
 ```bash
 ./install.sh --with-statusline
 ```
+
+</details>
 
 What `install.sh` does:
 1. Installs the Antigravity plugin to `~/.gemini/config/plugins/fabric` (with resolved `bun` and script paths in `mcp_config.json` and `hooks.json`).
@@ -164,6 +203,23 @@ If you installed `scripts/statusline.sh` (`./install.sh --with-statusline`), ena
 ```
 
 This both renders the live statusline and writes per-session context telemetry to `/tmp/agy-fabric-<uid>/sessions/` so `compact.pressure()` and auto-staging have live token counts.
+
+---
+
+## Benchmarks
+
+Measured by [fabric-swe](https://p-yan-6908.github.io/fabric-swe/): `pi` + `pi-fabric` (full code mode) + `pi-fovea` vs. vanilla `pi` (built-in tools only) — same model, prompts, sandbox, time budget, and grader on real-repository coding tasks. The same `fabric_exec` kernel powers this plugin.
+
+| Model | Arm | Resolved | Mean tool calls | Mean wall | Mean cost |
+| --- | --- | :-: | :-: | :-: | :-: |
+| GPT-6.1 Sol | fabric-fovea | **10/10** | **23.3** | **12.9 min** | **$0.56** |
+| | vanilla | 9/10 | 67.8 | 13.7 min | $0.59 |
+| GPT-6.1 Terra | fabric-fovea | 8/10 | **42.6** | **11.6 min** | **$0.99** |
+| | vanilla | **9/10** | 106.4 | 13.9 min | $1.11 |
+| GPT-6 Luna | fabric-fovea | 7/10 | **42.9** | 26.2 min | $0.08 |
+| | vanilla | **8/10** | 98.8 | **22.9 min** | $0.08 |
+
+Code mode cuts tool calls by **57–66%** at comparable resolve rates (within noise at *n* = 10). Full per-task data, methodology, and run files: [p-yan-6908/fabric-swe](https://github.com/p-yan-6908/fabric-swe).
 
 ---
 
