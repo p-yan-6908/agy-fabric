@@ -129,12 +129,17 @@ const RE_SINGLE_HEADER =
 
 const RE_SPINNER = /^(\s*)([⣾⣽⣻⢿⡿⣟⣯⣷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏])\s+Calling\s+MCP\s+tool\.{0,3}\s*$/
 
-const RE_EXPANDED_CALL = /^(\s*│\s*)([●○◉✓✗])\s+[\w./:-]*fabric_exec\((.*)$/
+const RE_EXPANDED_CALL = /^(\s*(?:│\s*)?)([●○◉✓✗])\s+[\w./:-]*fabric_exec\((.*)$/
 
 const RE_EXPANDED_CONT = /^(\s*│\s+)(?!([●○◉✓✗▾▸]\s|\s*⎿))(.*)$/
 
+const RE_EXPANDED_CONT_BARE =
+  /^(\s*)(?!([●○◉✓✗▾▸>─└⣾⣽⣻⢿⡿⣟⣯⣷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|⎿))(.+)$/
+
+const RE_EXPANDED_END = /\}\)(?:\s*\(ctrl\+o\s+to\s+(?:expand|collapse)\))?\s*$/
+
 const RE_EXPANDED_RESULT =
-  /^(\s*│\s+⎿\s+)(.*?)(\s*\(ctrl\+o\s+to\s+(?:expand|collapse)\))?\s*$/
+  /^(\s*(?:│\s+)?⎿\s+)(.*?)(\s*\(ctrl\+o\s+to\s+(?:expand|collapse)\))?\s*$/
 
 const extractFallbackFromJson = rawArgs => {
   const nameM = /"name"\s*:\s*"([^"]{1,48})/.exec(rawArgs)
@@ -365,18 +370,21 @@ const computeOverlays = (screen, snapshot) => {
     const em = RE_EXPANDED_CALL.exec(line)
     if (em) {
       const gutter = em[1]
+      const hasPipe = gutter.includes('│')
       const bullet = em[2]
       let joinedArgs = em[3] || ''
       const contRows = []
       let look = r + 1
-      while (look < screen.rows && contRows.length < 5) {
+      while (!RE_EXPANDED_END.test(joinedArgs) && look < screen.rows && contRows.length < 5) {
         const nextLine = rowTexts[look]
-        const cm = RE_EXPANDED_CONT.exec(nextLine)
+        if (!nextLine || !nextLine.trim()) break
+        const cm = (hasPipe ? RE_EXPANDED_CONT : RE_EXPANDED_CONT_BARE).exec(nextLine)
         if (!cm) break
-        contRows.push({ row: look, gutter: cm[1], text: cm[3] || '' })
-        joinedArgs += cm[3] || ''
+        const frag = cm[3] || ''
+        contRows.push({ row: look, gutter: cm[1], text: frag })
+        joinedArgs += frag
         look++
-        if ((cm[3] || '').trimEnd().endsWith('})')) break
+        if (RE_EXPANDED_END.test(frag)) break
       }
 
       const { run, parsed } = matchExpandedRun(joinedArgs, allRuns, usedRunIds)
@@ -408,6 +416,9 @@ const computeOverlays = (screen, snapshot) => {
         if (ops) segs.push({ ansi: MUTED, text: ` · ${ops}` })
         if (isFailed) segs.push({ ansi: RED, text: ' · failed' })
         if (dur) segs.push({ ansi: MUTED, text: ` · ${dur}` })
+      }
+      if (/\(ctrl\+o\s+to\s+collapse\)/.test(joinedArgs)) {
+        segs.push({ ansi: DIM + MUTED, text: '  (ctrl+o)' })
       }
       overlays.set(r, clampAnsiLine(segs, cols))
 
@@ -488,13 +499,16 @@ const moveVert = (fromRow, toRow) => {
   return ''
 }
 
-const buildRelativePatch = (screen, prevOverlaid, nextOverlays, forceAll) => {
-  if (!forceAll && nextOverlays.size === 0 && prevOverlaid.size === 0) return ''
+const buildOverlayPatch = (screen, nextOverlays, forceAll) => {
+  const hasPrev = screen.hasOverlaidRows()
+  if (!forceAll && nextOverlays.size === 0 && !hasPrev) return ''
 
-  // Collect all rows we need to touch, sorted top-to-bottom
+  // Collect all rows we need to touch, sorted top-to-bottom.
+  // screen.rowOverlaid moves in lockstep with scrolls/inserts/deletes/clears,
+  // so stale overlays shifted by DECSTBM/SU/SD/IL/DL are always cleanly restored.
   const targetRows = new Set()
-  for (const r of prevOverlaid) {
-    if (!nextOverlays.has(r)) targetRows.add(r)
+  for (let r = 0; r < screen.rows; r++) {
+    if (screen.rowOverlaid[r] && !nextOverlays.has(r)) targetRows.add(r)
   }
   for (const r of nextOverlays.keys()) {
     targetRows.add(r)
@@ -502,20 +516,32 @@ const buildRelativePatch = (screen, prevOverlaid, nextOverlays, forceAll) => {
   if (targetRows.size === 0) return ''
 
   const sorted = [...targetRows].sort((a, b) => a - b)
+  const useAbs = screen.inAltScreen
+  const curCol = Math.max(0, Math.min(screen.cols - 1, screen.col))
   let curR = screen.row
   let out = '\x1b[?25l'
 
   for (const r of sorted) {
-    out += moveVert(curR, r)
-    curR = r
-    const content = nextOverlays.has(r) ? nextOverlays.get(r) : screen.renderRowAnsi(r)
-    out += `\r\x1b[2K${content}`
+    const isOverlay = nextOverlays.has(r)
+    const content = isOverlay ? nextOverlays.get(r) : screen.renderRowAnsi(r)
+    if (useAbs) {
+      out += `\x1b[${r + 1};1H\x1b[2K${content}`
+    } else {
+      out += moveVert(curR, r)
+      curR = r
+      out += `\r\x1b[2K${content}`
+    }
+    screen.rowOverlaid[r] = isOverlay
   }
 
-  // Restore exact cursor row, col, SGR, and visibility relative to screen.row
-  out += moveVert(curR, screen.row)
-  out += '\r'
-  if (screen.col > 0) out += `\x1b[${screen.col}C`
+  // Restore exact cursor row, col, SGR, and visibility
+  if (useAbs) {
+    out += `\x1b[${screen.row + 1};${curCol + 1}H`
+  } else {
+    out += moveVert(curR, screen.row)
+    out += '\r'
+    if (curCol > 0) out += `\x1b[${curCol}C`
+  }
   out += '\x1b[0m' + screen.curSgr
   out += screen.cursorVisible ? '\x1b[?25h' : '\x1b[?25l'
   return out
@@ -535,7 +561,6 @@ const initCols = process.stdout.columns || 120
 const initRows = process.stdout.rows || 40
 const screen = new VtScreen(initCols, initRows)
 const decoder = new StringDecoder('utf8')
-let overlaidRows = new Set()
 let pendingChunks = []
 let flushTimer = null
 let agyPid = null
@@ -594,8 +619,7 @@ const flushOutput = (finalFlush = false) => {
 
   const snapshot = readRunsSnapshot(agyPid, sessionStartedAt)
   const nextOverlays = computeOverlays(screen, snapshot)
-  const patch = buildRelativePatch(screen, overlaidRows, nextOverlays, false)
-  overlaidRows = new Set(nextOverlays.keys())
+  const patch = buildOverlayPatch(screen, nextOverlays, false)
   if (patch) {
     // Strip inner synchronized-update toggles so raw + patch render in one atomic frame
     const cleanRaw = outRaw.replace(/\x1b\[\?2026[hl]/g, '')
@@ -683,12 +707,11 @@ agyPid = proc.pid
 // Live refresh ticker while a Fabric program is actively executing (and auto-/new watcher)
 const liveTicker = setInterval(() => {
   checkAutoNewSignal()
-  if (overlaidRows.size === 0 || pendingChunks.length > 0) return
+  if (!screen.hasOverlaidRows() || pendingChunks.length > 0) return
   const snapshot = readRunsSnapshot(agyPid, sessionStartedAt)
   if (!snapshot?.active) return
   const nextOverlays = computeOverlays(screen, snapshot)
-  const patch = buildRelativePatch(screen, overlaidRows, nextOverlays, true)
-  overlaidRows = new Set(nextOverlays.keys())
+  const patch = buildOverlayPatch(screen, nextOverlays, true)
   if (patch) process.stdout.write(SYNC_START + patch + SYNC_END)
 }, 180)
 liveTicker.unref?.()
@@ -706,8 +729,8 @@ process.stdin.on('data', onStdinData)
 const onResize = () => {
   const cols = process.stdout.columns || 120
   const rows = process.stdout.rows || 40
-  overlaidRows.clear()
   screen.resize(cols, rows)
+  screen.clearOverlaidFlags()
   try {
     proc.terminal.resize(cols, rows)
   } catch {}

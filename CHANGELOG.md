@@ -3,6 +3,37 @@
 All notable changes to `agy-fabric` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- `scripts/statusline.sh` now reports cumulative session total tokens
+  (`tok`, with `↑` input including cache reads and `↓` output) and cumulative
+  session cache hit rate (`cache %`) aggregated across all turns in the
+  session's `transcript.jsonl` (cached per session by file signature), instead
+  of per-turn context size and last-turn cache rate. `ctx %` continues to
+  report current context window fill.
+- `agyf` now starts agy in its full-screen (alternate screen) rendering mode
+  (`altScreenMode: "always"`) when the TUI compositor is active, fixing
+  duplicated/garbled rows after backgrounding the terminal tab or reflowing.
+  Opt out with `agyf --inline` / `AGYF_INLINE=1`, your own `--settings`, or an
+  explicit `Rendering Mode` saved via `/config`.
+
+### Fixed
+
+- Fixed TUI compositor desync in full-screen (`altScreenMode`) where raw
+  `Called N MCP tools (fabric_fabric/fabric_exec)` rows leaked through or
+  overlays shifted onto wrong lines after scrolling or closing modals like
+  `/model`:
+  - Implemented `DECSTBM` (`CSI r`), `SU` (`CSI S`), `SD` (`CSI T`),
+    scroll-region-scoped `IL`/`DL`/`LF`/`RI`, alternate-screen save/restore,
+    and structured truecolor SGR tracking in `server/vt-screen.mjs`.
+  - Tracked overlaid rows inside `VtScreen` so overlays move/clear in lockstep
+    with scrolls, and switched `server/tui-proxy.mjs` to absolute `CUP`
+    addressing when in alternate-screen mode.
+- `agyf` no longer trips `set -u` on macOS bash 3.2 when launched with no
+  arguments (empty passthrough array).
+
 ## [1.0.0] - 2026-11-21
 
 ### Added

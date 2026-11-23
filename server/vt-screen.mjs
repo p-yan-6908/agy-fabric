@@ -1,6 +1,7 @@
 // Lightweight, zero-dependency VT100 shadow screen tracker.
-// Tracks exact cells (char + SGR) and cursor state for agy's full-screen TUI so
-// tui-proxy.mjs can cleanly overlay Fabric rows and restore non-Fabric rows without drift.
+// Tracks exact cells (char + SGR), scroll regions (DECSTBM), and cursor state for
+// agy's TUI (both alternate-screen and inline modes) so tui-proxy.mjs can cleanly
+// overlay Fabric rows and restore non-Fabric rows without drift.
 
 const isWideCodePoint = cp => {
   if (cp < 0x1100) return false
@@ -63,18 +64,103 @@ export const truncateVisual = (str, maxCols) => {
 const blankCell = () => ({ ch: ' ', sgr: '', w: 1 })
 const makeRow = cols => Array.from({ length: cols }, blankCell)
 
+const makeSgrState = () => ({ flags: new Set(), fg: '', bg: '' })
+const cloneSgrState = st => ({ flags: new Set(st.flags), fg: st.fg, bg: st.bg })
+const formatSgrState = st => {
+  const parts = []
+  for (const f of st.flags) parts.push(String(f))
+  if (st.fg) parts.push(st.fg)
+  if (st.bg) parts.push(st.bg)
+  return parts.length > 0 ? `\x1b[${parts.join(';')}m` : ''
+}
+
+const applySgrParams = (st, paramsStr) => {
+  if (!paramsStr) {
+    st.flags.clear()
+    st.fg = ''
+    st.bg = ''
+    return
+  }
+  const nums = paramsStr.split(';').map(s => (s === '' ? 0 : Number(s)))
+  for (let i = 0; i < nums.length; i++) {
+    const n = nums[i]
+    if (!Number.isFinite(n)) continue
+    if (n === 0) {
+      st.flags.clear()
+      st.fg = ''
+      st.bg = ''
+    } else if (n >= 1 && n <= 9) {
+      st.flags.add(n)
+    } else if (n === 21 || n === 22) {
+      st.flags.delete(1)
+      st.flags.delete(2)
+    } else if (n === 23) {
+      st.flags.delete(3)
+    } else if (n === 24) {
+      st.flags.delete(4)
+    } else if (n === 25) {
+      st.flags.delete(5)
+      st.flags.delete(6)
+    } else if (n === 27) {
+      st.flags.delete(7)
+    } else if (n === 28) {
+      st.flags.delete(8)
+    } else if (n === 29) {
+      st.flags.delete(9)
+    } else if ((n >= 30 && n <= 37) || (n >= 90 && n <= 97)) {
+      st.fg = String(n)
+    } else if (n === 39) {
+      st.fg = ''
+    } else if ((n >= 40 && n <= 47) || (n >= 100 && n <= 107)) {
+      st.bg = String(n)
+    } else if (n === 49) {
+      st.bg = ''
+    } else if (n === 38 || n === 48) {
+      const mode = nums[i + 1]
+      if (mode === 5 && i + 2 < nums.length) {
+        const val = `${n};5;${nums[i + 2]}`
+        if (n === 38) st.fg = val
+        else st.bg = val
+        i += 2
+      } else if (mode === 2 && i + 4 < nums.length) {
+        const val = `${n};2;${nums[i + 2]};${nums[i + 3]};${nums[i + 4]}`
+        if (n === 38) st.fg = val
+        else st.bg = val
+        i += 4
+      }
+    }
+  }
+}
+
 export class VtScreen {
   constructor(cols = 120, rows = 40) {
     this.cols = Math.max(20, cols)
     this.rows = Math.max(5, rows)
     this.grid = Array.from({ length: this.rows }, () => makeRow(this.cols))
+    this.rowOverlaid = Array.from({ length: this.rows }, () => false)
     this.row = 0
     this.col = 0
+    this.scrollTop = 0
+    this.scrollBottom = this.rows - 1
+    this.sgrState = makeSgrState()
     this.curSgr = ''
     this.cursorVisible = true
-    this.saved = { row: 0, col: 0, sgr: '' }
+    this.saved = { row: 0, col: 0, sgrState: makeSgrState(), curSgr: '' }
+    this.mainScreen = null
+    this.lastChar = ''
     this.pending = ''
     this.inAltScreen = false
+  }
+
+  hasOverlaidRows() {
+    for (let r = 0; r < this.rowOverlaid.length; r++) {
+      if (this.rowOverlaid[r]) return true
+    }
+    return false
+  }
+
+  clearOverlaidFlags() {
+    this.rowOverlaid.fill(false)
   }
 
   resize(cols, rows) {
@@ -89,15 +175,20 @@ export class VtScreen {
       }
       return row
     })
+    const nextOverlaid = Array.from({ length: nextRows }, (_, r) => Boolean(this.rowOverlaid[r]))
     this.cols = nextCols
     this.rows = nextRows
     this.grid = nextGrid
+    this.rowOverlaid = nextOverlaid
+    this.scrollTop = 0
+    this.scrollBottom = this.rows - 1
     this.row = Math.min(this.row, this.rows - 1)
     this.col = Math.min(this.col, this.cols - 1)
   }
 
   clearScreen() {
     this.grid = Array.from({ length: this.rows }, () => makeRow(this.cols))
+    this.rowOverlaid = Array.from({ length: this.rows }, () => false)
   }
 
   clearRow(r, fromCol = 0, toCol = this.cols) {
@@ -106,41 +197,115 @@ export class VtScreen {
     const start = Math.max(0, fromCol)
     const end = Math.min(this.cols, toCol)
     for (let c = start; c < end; c++) row[c] = blankCell()
-  }
-
-  scrollUp(n = 1) {
-    for (let i = 0; i < n; i++) {
-      this.grid.shift()
-      this.grid.push(makeRow(this.cols))
+    if (start === 0 && end >= this.cols) {
+      this.rowOverlaid[r] = false
     }
   }
 
-  scrollDown(n = 1) {
-    for (let i = 0; i < n; i++) {
-      this.grid.pop()
-      this.grid.unshift(makeRow(this.cols))
+  scrollUp(n = 1, top = this.scrollTop, bottom = this.scrollBottom) {
+    const t = Math.max(0, Math.min(this.rows - 1, top))
+    const b = Math.max(t, Math.min(this.rows - 1, bottom))
+    const height = b - t + 1
+    if (height <= 0) return
+    const count = Math.min(Math.max(1, n), height)
+    this.grid.splice(t, count)
+    this.grid.splice(b - count + 1, 0, ...Array.from({ length: count }, () => makeRow(this.cols)))
+    this.rowOverlaid.splice(t, count)
+    this.rowOverlaid.splice(b - count + 1, 0, ...Array.from({ length: count }, () => false))
+  }
+
+  scrollDown(n = 1, top = this.scrollTop, bottom = this.scrollBottom) {
+    const t = Math.max(0, Math.min(this.rows - 1, top))
+    const b = Math.max(t, Math.min(this.rows - 1, bottom))
+    const height = b - t + 1
+    if (height <= 0) return
+    const count = Math.min(Math.max(1, n), height)
+    this.grid.splice(b - count + 1, count)
+    this.grid.splice(t, 0, ...Array.from({ length: count }, () => makeRow(this.cols)))
+    this.rowOverlaid.splice(b - count + 1, count)
+    this.rowOverlaid.splice(t, 0, ...Array.from({ length: count }, () => false))
+  }
+
+  lineFeed() {
+    if (this.row === this.scrollBottom) {
+      this.scrollUp(1)
+    } else if (this.row < this.rows - 1) {
+      this.row += 1
     }
+  }
+
+  reverseIndex() {
+    if (this.row === this.scrollTop) {
+      this.scrollDown(1)
+    } else if (this.row > 0) {
+      this.row -= 1
+    }
+  }
+
+  enterAltScreen(saveMain) {
+    if (saveMain && !this.inAltScreen) {
+      this.mainScreen = {
+        cols: this.cols,
+        rows: this.rows,
+        grid: this.grid,
+        rowOverlaid: this.rowOverlaid,
+        row: this.row,
+        col: this.col,
+        scrollTop: this.scrollTop,
+        scrollBottom: this.scrollBottom,
+        sgrState: cloneSgrState(this.sgrState),
+        curSgr: this.curSgr,
+      }
+    }
+    this.inAltScreen = true
+    this.scrollTop = 0
+    this.scrollBottom = this.rows - 1
+    this.clearScreen()
+    this.row = 0
+    this.col = 0
+  }
+
+  leaveAltScreen(restoreMain) {
+    this.inAltScreen = false
+    if (restoreMain && this.mainScreen && this.mainScreen.cols === this.cols && this.mainScreen.rows === this.rows) {
+      const m = this.mainScreen
+      this.grid = m.grid
+      this.rowOverlaid = m.rowOverlaid
+      this.row = Math.min(this.rows - 1, m.row)
+      this.col = Math.min(this.cols - 1, m.col)
+      this.scrollTop = 0
+      this.scrollBottom = this.rows - 1
+      this.sgrState = m.sgrState
+      this.curSgr = m.curSgr
+      this.mainScreen = null
+      return
+    }
+    this.mainScreen = null
+    this.scrollTop = 0
+    this.scrollBottom = this.rows - 1
+    this.clearScreen()
+    this.row = 0
+    this.col = 0
   }
 
   putChar(ch) {
     const w = charWidth(ch)
     if (w === 0) {
       // Combining mark attaches to previous cell
-      if (this.col > 0 && this.grid[this.row]?.[this.col - 1]) {
-        this.grid[this.row][this.col - 1].ch += ch
+      const prevCol = Math.min(this.col, this.cols) - 1
+      if (prevCol >= 0 && this.grid[this.row]?.[prevCol]) {
+        this.grid[this.row][prevCol].ch += ch
       }
       return
     }
     if (this.col >= this.cols) {
       this.col = 0
-      if (this.row < this.rows - 1) this.row += 1
-      else this.scrollUp(1)
+      this.lineFeed()
     }
     if (w === 2 && this.col === this.cols - 1) {
       this.grid[this.row][this.col] = blankCell()
       this.col = 0
-      if (this.row < this.rows - 1) this.row += 1
-      else this.scrollUp(1)
+      this.lineFeed()
     }
     const row = this.grid[this.row]
     if (!row) return
@@ -148,11 +313,19 @@ export class VtScreen {
     if (row[this.col]?.w === 0 && this.col > 0) {
       row[this.col - 1] = blankCell()
     }
+    // If overwriting leader of a wide char with a narrow char, blank its trailer
+    if (row[this.col]?.w === 2 && w === 1 && this.col + 1 < this.cols) {
+      row[this.col + 1] = blankCell()
+    }
     row[this.col] = { ch, sgr: this.curSgr, w }
     if (w === 2 && this.col + 1 < this.cols) {
+      if (row[this.col + 1]?.w === 2 && this.col + 2 < this.cols) {
+        row[this.col + 2] = blankCell()
+      }
       row[this.col + 1] = { ch: '', sgr: this.curSgr, w: 0 }
     }
     this.col += w
+    this.lastChar = ch
   }
 
   handleCsi(paramsStr, finalByte) {
@@ -168,22 +341,14 @@ export class VtScreen {
       if (finalByte === 'h') {
         for (const n of nums) {
           if (n === 25) this.cursorVisible = true
-          if (n === 1049 || n === 47 || n === 1047) {
-            this.inAltScreen = true
-            this.clearScreen()
-            this.row = 0
-            this.col = 0
-          }
+          if (n === 1049) this.enterAltScreen(true)
+          else if (n === 47 || n === 1047) this.enterAltScreen(false)
         }
       } else if (finalByte === 'l') {
         for (const n of nums) {
           if (n === 25) this.cursorVisible = false
-          if (n === 1049 || n === 47 || n === 1047) {
-            this.inAltScreen = false
-            this.clearScreen()
-            this.row = 0
-            this.col = 0
-          }
+          if (n === 1049) this.leaveAltScreen(true)
+          else if (n === 47 || n === 1047) this.leaveAltScreen(false)
         }
       }
       return
@@ -196,31 +361,65 @@ export class VtScreen {
         this.row = Math.max(0, Math.min(this.rows - 1, (p1 || 1) - 1))
         this.col = Math.max(0, Math.min(this.cols - 1, (p2 || 1) - 1))
         break
-      case 'A':
-        this.row = Math.max(0, this.row - (p1 || 1))
+      case 'A': {
+        const minRow = this.row >= this.scrollTop ? this.scrollTop : 0
+        this.row = Math.max(minRow, this.row - (p1 || 1))
         break
+      }
       case 'B':
-        this.row = Math.min(this.rows - 1, this.row + (p1 || 1))
+      case 'e': {
+        const maxRow = this.row <= this.scrollBottom ? this.scrollBottom : this.rows - 1
+        this.row = Math.min(maxRow, this.row + (p1 || 1))
         break
+      }
       case 'C':
+      case 'a':
         this.col = Math.min(this.cols - 1, this.col + (p1 || 1))
         break
       case 'D':
         this.col = Math.max(0, Math.min(this.cols - 1, this.col) - (p1 || 1))
         break
-      case 'E':
-        this.row = Math.min(this.rows - 1, this.row + (p1 || 1))
+      case 'E': {
+        const maxRow = this.row <= this.scrollBottom ? this.scrollBottom : this.rows - 1
+        this.row = Math.min(maxRow, this.row + (p1 || 1))
         this.col = 0
         break
-      case 'F':
-        this.row = Math.max(0, this.row - (p1 || 1))
+      }
+      case 'F': {
+        const minRow = this.row >= this.scrollTop ? this.scrollTop : 0
+        this.row = Math.max(minRow, this.row - (p1 || 1))
         this.col = 0
         break
+      }
       case 'G':
+      case '`':
         this.col = Math.max(0, Math.min(this.cols - 1, (p1 || 1) - 1))
         break
       case 'd':
         this.row = Math.max(0, Math.min(this.rows - 1, (p1 || 1) - 1))
+        break
+      case 'r': {
+        // DECSTBM: Set Top and Bottom Margins (1-indexed), homes cursor
+        const top = Math.max(0, Math.min(this.rows - 1, (p1 || 1) - 1))
+        const bottom = Math.max(0, Math.min(this.rows - 1, (p2 || this.rows) - 1))
+        if (top < bottom) {
+          this.scrollTop = top
+          this.scrollBottom = bottom
+        } else {
+          this.scrollTop = 0
+          this.scrollBottom = this.rows - 1
+        }
+        this.row = 0
+        this.col = 0
+        break
+      }
+      case 'S':
+        // SU: Scroll Up N lines within active scroll region
+        this.scrollUp(p1 || 1)
+        break
+      case 'T':
+        // SD: Scroll Down N lines within active scroll region (ignore 5-param mouse highlight)
+        if (nums.length <= 1) this.scrollDown(p1 || 1)
         break
       case 'J': {
         const mode = p1 || 0
@@ -229,7 +428,7 @@ export class VtScreen {
           for (let r = this.row + 1; r < this.rows; r++) this.clearRow(r)
         } else if (mode === 1) {
           for (let r = 0; r < this.row; r++) this.clearRow(r)
-          this.clearRow(this.row, 0, this.col + 1)
+          this.clearRow(this.row, 0, Math.min(this.cols, this.col + 1))
         } else if (mode === 2 || mode === 3) {
           this.clearScreen()
         }
@@ -238,14 +437,14 @@ export class VtScreen {
       case 'K': {
         const mode = p1 || 0
         if (mode === 0) this.clearRow(this.row, this.col, this.cols)
-        else if (mode === 1) this.clearRow(this.row, 0, this.col + 1)
+        else if (mode === 1) this.clearRow(this.row, 0, Math.min(this.cols, this.col + 1))
         else if (mode === 2) this.clearRow(this.row, 0, this.cols)
         break
       }
       case 'P': {
         const n = p1 || 1
         const row = this.grid[this.row]
-        if (row) {
+        if (row && this.col < this.cols) {
           row.splice(this.col, n)
           while (row.length < this.cols) row.push(blankCell())
         }
@@ -254,7 +453,7 @@ export class VtScreen {
       case '@': {
         const n = p1 || 1
         const row = this.grid[this.row]
-        if (row) {
+        if (row && this.col < this.cols) {
           row.splice(this.col, 0, ...Array.from({ length: n }, blankCell))
           row.length = this.cols
         }
@@ -266,38 +465,42 @@ export class VtScreen {
         break
       }
       case 'L': {
-        const n = p1 || 1
-        for (let i = 0; i < n; i++) {
-          this.grid.splice(this.row, 0, makeRow(this.cols))
-          this.grid.pop()
+        if (this.row >= this.scrollTop && this.row <= this.scrollBottom) {
+          this.scrollDown(p1 || 1, this.row, this.scrollBottom)
         }
         break
       }
       case 'M': {
-        const n = p1 || 1
-        for (let i = 0; i < n; i++) {
-          this.grid.splice(this.row, 1)
-          this.grid.push(makeRow(this.cols))
+        if (this.row >= this.scrollTop && this.row <= this.scrollBottom) {
+          this.scrollUp(p1 || 1, this.row, this.scrollBottom)
+        }
+        break
+      }
+      case 'b': {
+        if (this.lastChar) {
+          const n = Math.min(this.cols, p1 || 1)
+          for (let k = 0; k < n; k++) this.putChar(this.lastChar)
         }
         break
       }
       case 'm': {
-        if (!paramsStr || paramsStr === '0') {
-          this.curSgr = ''
-        } else {
-          const seq = `\x1b[${paramsStr}m`
-          if (paramsStr.startsWith('0;')) this.curSgr = seq
-          else this.curSgr = (this.curSgr + seq).slice(-96)
-        }
+        applySgrParams(this.sgrState, paramsStr)
+        this.curSgr = formatSgrState(this.sgrState)
         break
       }
       case 's':
-        this.saved = { row: this.row, col: this.col, sgr: this.curSgr }
+        this.saved = {
+          row: this.row,
+          col: this.col,
+          sgrState: cloneSgrState(this.sgrState),
+          curSgr: this.curSgr,
+        }
         break
       case 'u':
         this.row = Math.min(this.rows - 1, this.saved.row)
         this.col = Math.min(this.cols - 1, this.saved.col)
-        this.curSgr = this.saved.sgr
+        this.sgrState = cloneSgrState(this.saved.sgrState)
+        this.curSgr = this.saved.curSgr
         break
     }
   }
@@ -379,26 +582,34 @@ export class VtScreen {
           continue
         }
         if (next === '7') {
-          this.saved = { row: this.row, col: this.col, sgr: this.curSgr }
+          this.saved = {
+            row: this.row,
+            col: this.col,
+            sgrState: cloneSgrState(this.sgrState),
+            curSgr: this.curSgr,
+          }
         } else if (next === '8') {
           this.row = Math.min(this.rows - 1, this.saved.row)
           this.col = Math.min(this.cols - 1, this.saved.col)
-          this.curSgr = this.saved.sgr
+          this.sgrState = cloneSgrState(this.saved.sgrState)
+          this.curSgr = this.saved.curSgr
         } else if (next === 'M') {
-          if (this.row > 0) this.row -= 1
-          else this.scrollDown(1)
+          this.reverseIndex()
         } else if (next === 'D') {
-          if (this.row < this.rows - 1) this.row += 1
-          else this.scrollUp(1)
+          this.lineFeed()
         } else if (next === 'E') {
           this.col = 0
-          if (this.row < this.rows - 1) this.row += 1
-          else this.scrollUp(1)
+          this.lineFeed()
         } else if (next === 'c') {
+          this.scrollTop = 0
+          this.scrollBottom = this.rows - 1
           this.clearScreen()
           this.row = 0
           this.col = 0
+          this.sgrState = makeSgrState()
           this.curSgr = ''
+          this.inAltScreen = false
+          this.mainScreen = null
         }
         i += 2
         continue
@@ -409,14 +620,14 @@ export class VtScreen {
         i++
         continue
       }
-      if (code === 0x0a) {
-        if (this.row < this.rows - 1) this.row += 1
-        else this.scrollUp(1)
+      if (code === 0x0a || code === 0x0b || code === 0x0c) {
+        this.lineFeed()
         i++
         continue
       }
       if (code === 0x08) {
-        if (this.col > 0) this.col -= 1
+        if (this.col >= this.cols) this.col = Math.max(0, this.cols - 2)
+        else if (this.col > 0) this.col -= 1
         i++
         continue
       }

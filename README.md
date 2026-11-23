@@ -50,6 +50,7 @@ Powered by [Pi Fabric](https://www.npmjs.com/package/pi-fabric), [Pi Fovea](http
     - Collapsed: `● Fabric · 12 runs  ✓ Read ×14 · Edit ×4 · Bash ×3 · 8.2s  (ctrl+o)`
     - Expanded (`ctrl+o`): `│ ✓ read_pkg · Read ×1 · 11ms` + indented description & op summary
   - Automatically bypassed in non-TTY / `-p` print mode, or opt out anytime with `agyf --plain` / `AGYF_PLAIN=1`.
+  - Runs agy in its full-screen (alternate screen) rendering mode by default, so the TUI stays intact when the tab is backgrounded or the terminal reflows. Use `agyf --inline` / `AGYF_INLINE=1` (or save a `Rendering Mode` in `/config`) to keep native inline scrollback.
 - **Optional Live Telemetry Statusline (`scripts/statusline.sh`)**
   - Displays model, context %, session tokens, cache hit %, quota, and live Fabric run/op badge (`fabric 2r·2op`) — and feeds live token telemetry into `compact.pressure()`.
 
@@ -116,6 +117,9 @@ agyf
 
 # Start without the visual PTY compositor (raw agy output)
 agyf --plain
+
+# Keep agy's native inline (scrollback) rendering instead of full screen
+agyf --inline
 
 # One-shot prompt mode
 agyf -p="Sketch this repository with Fovea and summarize its entrypoints"

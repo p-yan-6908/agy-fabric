@@ -26,6 +26,8 @@ AGY_PATH="$(find_bin agy "${AGY_BIN:-}" "$HOME/.local/bin/agy" "/opt/homebrew/bi
 
 # Parse --plain flag (pass all other args straight through to agy)
 PLAIN="${AGYF_PLAIN:-0}"
+INLINE="${AGYF_INLINE:-0}"
+USER_SETTINGS=0
 PASSTHROUGH=()
 USE_PROXY=1
 
@@ -38,6 +40,13 @@ for arg in "$@"; do
     --plain)
       PLAIN=1
       ;;
+    --inline)
+      INLINE=1
+      ;;
+    --settings|--settings=*)
+      USER_SETTINGS=1
+      PASSTHROUGH+=("$arg")
+      ;;
     -p|--print|--prompt|--print=*|--prompt=*|-p=*|--output-format|--output-format=*|--help|-h|help|plugin|plugins|mcp|models|agent|agents|update|install|changelog|acp|remote-control|mic-serve)
       USE_PROXY=0
       PASSTHROUGH+=("$arg")
@@ -49,7 +58,7 @@ for arg in "$@"; do
 done
 
 if [ "$PLAIN" = "1" ] || [ "$USE_PROXY" -eq 0 ]; then
-  exec "$AGY_PATH" --agent fabric "${PASSTHROUGH[@]}"
+  exec "$AGY_PATH" --agent fabric ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,10 +71,22 @@ do
   fi
 done
 
+# Full-screen (alternate screen) rendering by default under the compositor.
+# Inline mode repaints with relative cursor moves over scrollback, which desyncs
+# (duplicated/garbled rows) when the terminal reflows or the tab is backgrounded.
+# Opt out with --inline / AGYF_INLINE=1, by passing your own --settings, or by
+# saving an explicit `Rendering Mode` (altScreenMode) via /config.
+SETTINGS_FILE="${AGY_SETTINGS_FILE:-$HOME/.gemini/antigravity-cli/settings.json}"
+RENDER_ARGS=()
+if [ "$INLINE" != "1" ] && [ "$USER_SETTINGS" -eq 0 ] \
+  && ! grep -q '"altScreenMode"' "$SETTINGS_FILE" 2>/dev/null; then
+  RENDER_ARGS=(--settings '{"altScreenMode":"always"}')
+fi
+
 BUN_PATH="$(find_bin bun "$HOME/.bun/bin/bun" "/opt/homebrew/bin/bun" "/usr/local/bin/bun" || true)"
 
 if [ -n "$PROXY_SCRIPT" ] && [ -n "$BUN_PATH" ]; then
-  exec "$BUN_PATH" "$PROXY_SCRIPT" "$AGY_PATH" --agent fabric "${PASSTHROUGH[@]}"
+  exec "$BUN_PATH" "$PROXY_SCRIPT" "$AGY_PATH" --agent fabric ${RENDER_ARGS[@]+"${RENDER_ARGS[@]}"} ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
 fi
 
-exec "$AGY_PATH" --agent fabric "${PASSTHROUGH[@]}"
+exec "$AGY_PATH" --agent fabric ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
