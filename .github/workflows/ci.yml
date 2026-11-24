@@ -26,7 +26,7 @@ jobs:
 
       - name: Shell scripts parse
         run: |
-          bash -n install.sh uninstall.sh bin/agyf scripts/statusline.sh
+          bash -n install.sh uninstall.sh bin/agy scripts/statusline.sh
           echo "ok: shell scripts"
 
       - name: Server entrypoints bundle-check

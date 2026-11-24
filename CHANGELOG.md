@@ -7,17 +7,27 @@ All notable changes to `agy-fabric` are documented here. The format follows
 
 ### Changed
 
+- Replaced the `agyf` CLI command with `agy` (`bin/agy`) so running `agy` in the
+  terminal launches Fabric Code Mode directly:
+  - `install.sh` preserves any existing stock `agy` binary at
+    `<bin-dir>/.agy-orig/agy` (restored by `uninstall.sh`) and removes legacy
+    `agyf` launchers.
+  - CLI management subcommands (`plugin`, `mcp`, `models`, `update`, `help`,
+    `--version`, etc.), explicit non-fabric `--agent <name>`, and `--no-fabric`
+    pass straight through to the stock `agy` binary.
+  - Added `AGY_FABRIC_PLAIN` / `AGY_FABRIC_INLINE` environment variables (with
+    `AGYF_PLAIN` / `AGYF_INLINE` retained for backwards compatibility).
 - `scripts/statusline.sh` now reports cumulative session total tokens
-  (`tok`, with `↑` input including cache reads and `↓` output) and cumulative
-  session cache hit rate (`cache %`) aggregated across all turns in the
-  session's `transcript.jsonl` (cached per session by file signature), instead
-  of per-turn context size and last-turn cache rate. `ctx %` continues to
-  report current context window fill.
-- `agyf` now starts agy in its full-screen (alternate screen) rendering mode
-  (`altScreenMode: "always"`) when the TUI compositor is active, fixing
-  duplicated/garbled rows after backgrounding the terminal tab or reflowing.
-  Opt out with `agyf --inline` / `AGYF_INLINE=1`, your own `--settings`, or an
-  explicit `Rendering Mode` saved via `/config`.
+  (`tok`, with `↑` input including cache reads and `↓` output) and both
+  last-turn and cumulative session average cache hit rate (`cache 99% (avg 96%)`)
+  aggregated from the session's `transcript.jsonl` (cached per session by file
+  signature), and removes the Fabric run/op badge from the statusline. `ctx %`
+  continues to report current context window fill.
+- `agy` launcher now starts Antigravity in its full-screen (alternate screen)
+  rendering mode (`altScreenMode: "always"`) when the TUI compositor is active,
+  fixing duplicated/garbled rows after backgrounding the terminal tab or
+  reflowing. Opt out with `agy --inline` / `AGY_FABRIC_INLINE=1`, your own
+  `--settings`, or an explicit `Rendering Mode` saved via `/config`.
 
 ### Fixed
 
@@ -31,8 +41,8 @@ All notable changes to `agy-fabric` are documented here. The format follows
   - Tracked overlaid rows inside `VtScreen` so overlays move/clear in lockstep
     with scrolls, and switched `server/tui-proxy.mjs` to absolute `CUP`
     addressing when in alternate-screen mode.
-- `agyf` no longer trips `set -u` on macOS bash 3.2 when launched with no
-  arguments (empty passthrough array).
+- Launcher script no longer trips `set -u` on macOS bash 3.2 when launched with
+  no arguments (empty passthrough array).
 
 ## [1.0.0] - 2026-11-21
 

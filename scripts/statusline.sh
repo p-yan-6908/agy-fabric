@@ -116,13 +116,13 @@ if [ -n "$transcript_file" ]; then
   [ -n "$safe_sid" ] && usage_cache_file="${fabric_dir}/sessions/usage-${safe_sid}.json"
   cached_usage=""
   if [ -n "$usage_cache_file" ] && [ -s "$usage_cache_file" ] && [ -n "$t_sig" ]; then
-    cached_usage="$(jq -c --arg sig "$t_sig" --arg path "$transcript_file" 'select(.sig == $sig and .path == $path)' "$usage_cache_file" 2>/dev/null || true)"
+    cached_usage="$(jq -c --arg sig "$t_sig" --arg path "$transcript_file" 'select(.sig == $sig and .path == $path and .last_in != null)' "$usage_cache_file" 2>/dev/null || true)"
   fi
   if [ -n "$cached_usage" ]; then
     session_usage="$cached_usage"
   else
     computed_usage="$(jq -Rnc --arg sig "$t_sig" --arg path "$transcript_file" '
-      reduce inputs as $line ({sig: $sig, path: $path, in: 0, cr: 0, cc: 0, out: 0, turns: 0};
+      reduce inputs as $line ({sig: $sig, path: $path, in: 0, cr: 0, cc: 0, out: 0, turns: 0, last_in: 0, last_cr: 0, last_cc: 0};
         (try ($line | fromjson) catch null) as $e |
         if ($e | type) == "object" and (
           ($e.input_tokens != null) or
@@ -132,11 +132,17 @@ if [ -n "$transcript_file" ]; then
           ($e.cache_creation_tokens != null) or
           ($e.cache_creation_input_tokens != null)
         ) then
-          .in += ($e.input_tokens // 0)
-          | .cr += ($e.cache_read_tokens // $e.cache_read_input_tokens // 0)
-          | .cc += ($e.cache_creation_tokens // $e.cache_creation_input_tokens // 0)
+          ($e.input_tokens // 0) as $ei |
+          ($e.cache_read_tokens // $e.cache_read_input_tokens // 0) as $ecr |
+          ($e.cache_creation_tokens // $e.cache_creation_input_tokens // 0) as $ecc |
+          .in += $ei
+          | .cr += $ecr
+          | .cc += $ecc
           | .out += ($e.output_tokens // 0)
           | .turns += 1
+          | if ($ei + $ecr + $ecc) > 0 then
+              .last_in = $ei | .last_cr = $ecr | .last_cc = $ecc
+            else . end
         else
           .
         end
@@ -157,21 +163,7 @@ if [ -n "$tel_cwd" ] && [ -s "${tel_cwd}/.pi/fabric/compaction/pending.json" ]; 
   pending_tok="$(jq -r '.estimatedTokensAfter // empty' "${tel_cwd}/.pi/fabric/compaction/pending.json" 2>/dev/null)"
 fi
 
-fabric_runs_file="${fabric_dir}/sessions/runs-${PPID:-0}.json"
-fabric_badge=""
-if [ -s "$fabric_runs_file" ]; then
-  fabric_badge="$(jq -r '
-    if .active != null then
-      "run:" + (.active.name // "fabric")
-    elif ((.totals.runs // 0) > 0) then
-      "done:" + ((.totals.runs // 0) | tostring) + ":" + ((.totals.ops // 0) | tostring) + ":" + ((.totals.errors // 0) | tostring)
-    else
-      ""
-    end
-  ' "$fabric_runs_file" 2>/dev/null || true)"
-fi
-
-jq -r --slurpfile prev "$state_file" --argjson sess "$session_usage" --arg ptok "$pending_tok" --arg fbadge "$fabric_badge" '
+jq -r --slurpfile prev "$state_file" --argjson sess "$session_usage" --arg ptok "$pending_tok" '
   def ansi($code; $s): "\u001b[" + $code + "m" + $s + "\u001b[0m";
   def dim($s): ansi("2"; $s);
   def bold($s): ansi("1"; $s);
@@ -230,7 +222,7 @@ jq -r --slurpfile prev "$state_file" --argjson sess "$session_usage" --arg ptok 
     (if ($ptok | length) > 0 then " " + cyan("[~" + fmt_tok($ptok | tonumber) + "]") else "" end)
   ) as $ctx_seg |
 
-  # 3 & 4. Cumulative session tokens used & cumulative session cache hit rate
+  # 3 & 4. Cumulative session tokens used & cache hit rate (last turn + session avg)
   (.session_id // .conversation_id // "") as $sid |
   ($prev[0] // {}) as $p |
   (.context_window.current_usage // {}) as $live_cur |
@@ -276,9 +268,28 @@ jq -r --slurpfile prev "$state_file" --argjson sess "$session_usage" --arg ptok 
      "tok " + bold(fmt_tok($sess_tok))
    end) as $tok_seg |
 
-  (if $usage.cache_denom > 0 then
-     (($usage.cache_read * 100 / $usage.cache_denom) | round) as $cpct |
-     "cache " + cyan(($cpct | tostring) + "%")
+  ((($sess.last_in // 0) + ($sess.last_cc // 0) + ($sess.last_cr // 0))) as $sess_last_denom |
+  (if $live_denom > 0 then
+     { cr: $lc_cr, denom: $live_denom }
+   elif $has_sess and $sess_last_denom > 0 then
+     { cr: ($sess.last_cr // 0), denom: $sess_last_denom }
+   elif $cur_denom > 0 then
+     { cr: $cur_cr, denom: $cur_denom }
+   else
+     { cr: 0, denom: 0 }
+   end) as $last_cache |
+
+  (if $last_cache.denom > 0 then
+     (($last_cache.cr * 100 / $last_cache.denom) | round) as $last_cpct |
+     (if $has_sess and $usage.cache_denom > 0 and $width >= 90 then
+        (($usage.cache_read * 100 / $usage.cache_denom) | round) as $avg_cpct |
+        "cache " + cyan(($last_cpct | tostring) + "%") + dim(" (avg " + ($avg_cpct | tostring) + "%)")
+      else
+        "cache " + cyan(($last_cpct | tostring) + "%")
+      end)
+   elif $usage.cache_denom > 0 then
+     (($usage.cache_read * 100 / $usage.cache_denom) | round) as $avg_cpct |
+     "cache " + cyan(($avg_cpct | tostring) + "%")
    else
      "cache " + dim("--")
    end) as $cache_seg |
@@ -320,22 +331,6 @@ jq -r --slurpfile prev "$state_file" --argjson sess "$session_usage" --arg ptok 
    end) as $qw_str |
   ("quota " + $q5_str + " " + $qw_str) as $quota_seg |
 
-  # 6. Optional Fabric live activity badge (when fabric_exec has run in this session)
-  (if ($fbadge | startswith("run:")) then
-     yellow("fabric " + ($fbadge | sub("^run:"; "")))
-   elif ($fbadge | startswith("done:")) then
-     (($fbadge | sub("^done:"; "") | split(":")) as $fp |
-      ($fp[0] | tonumber) as $fruns |
-      ($fp[1] | tonumber) as $fops |
-      ($fp[2] | tonumber) as $ferr |
-      cyan("fabric " + ($fruns | tostring) + "r") + dim("·" + ($fops | tostring) + "op") +
-        (if $ferr > 0 then " " + red("✗" + ($ferr | tostring)) else "" end))
-   else
-     ""
-   end) as $fabric_seg |
-
   dim(" │ ") as $sep |
-  ([magenta($model_label), $ctx_seg, $tok_seg, $cache_seg, $quota_seg] +
-    (if ($fabric_seg | length) > 0 then [$fabric_seg] else [] end)
-  ) | join($sep)
+  [magenta($model_label), $ctx_seg, $tok_seg, $cache_seg, $quota_seg] | join($sep)
 ' <<< "$input" 2>/dev/null

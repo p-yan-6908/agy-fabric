@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // CLI helper for Pi Fabric's deterministic (0-LLM) algorithmic compaction in agy.
 // Usage:
-//   agy-compact                       # compact latest conversation & launch fresh `agy --agent fabric`
+//   agy-compact                       # compact latest conversation & launch fresh `agy`
 //   agy-compact "Keep auth bug notes" # custom focus instructions
 //   agy-compact --stage-only          # stage pending.json without launching agy (next `/new` picks it up)
 //   agy-compact --status              # show current carry-forward & staged/committed compaction status
@@ -9,13 +9,29 @@
 //   agy-compact --cancel              # clear pending staged compaction
 
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { closeSync, existsSync, openSync, readSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HOME = homedir()
 const BIN_DIR = dirname(fileURLToPath(import.meta.url))
+
+const isFabricLauncher = filePath => {
+  try {
+    const fd = openSync(filePath, 'r')
+    try {
+      const buf = Buffer.alloc(256)
+      const n = readSync(fd, buf, 0, 256, 0)
+      const head = buf.subarray(0, n).toString('utf8')
+      return head.startsWith('#!') && head.includes('agy-fabric-launcher')
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return false
+  }
+}
 
 const resolveCompactorPath = () => {
   const candidates = [
@@ -29,13 +45,13 @@ const resolveCompactorPath = () => {
   return null
 }
 
-const resolveAgyfBin = () => {
+const resolveLauncherBin = () => {
   const candidates = [
-    join(BIN_DIR, 'agyf'),
-    join(HOME, '.local', 'bin', 'agyf'),
+    join(BIN_DIR, 'agy'),
+    join(HOME, '.local', 'bin', 'agy'),
   ]
   for (const c of candidates) {
-    if (c && existsSync(c)) return c
+    if (c && existsSync(c) && isFabricLauncher(c)) return c
   }
   return null
 }
@@ -43,12 +59,14 @@ const resolveAgyfBin = () => {
 const resolveAgyBin = () => {
   const candidates = [
     process.env.AGY_BIN || null,
+    join(BIN_DIR, '.agy-orig', 'agy'),
+    join(HOME, '.local', 'bin', '.agy-orig', 'agy'),
     join(HOME, '.local', 'bin', 'agy'),
     '/opt/homebrew/bin/agy',
     '/usr/local/bin/agy',
   ]
   for (const c of candidates) {
-    if (c && existsSync(c)) return c
+    if (c && existsSync(c) && !isFabricLauncher(c)) return c
   }
   return 'agy'
 }
@@ -115,7 +133,7 @@ if (carryIdx >= 0) {
 }
 
 const stageOnly = args.includes('--stage-only')
-const plain = args.includes('--plain') || process.env.AGYF_PLAIN === '1'
+const plain = args.includes('--plain') || process.env.AGY_FABRIC_PLAIN === '1' || process.env.AGYF_PLAIN === '1'
 const instructions = args.filter(a => !a.startsWith('--')).join(' ').trim()
 
 const matchedSession = findSessionForCwd(cwd)
@@ -139,12 +157,12 @@ try {
       `   Saved to: ${cwd}/.pi/fabric/compaction/pending.json`,
   )
   if (stageOnly) {
-    console.log('   Run `/new` inside agy or `agyf` in terminal to start with this compacted context.')
+    console.log('   Run `/new` inside agy or launch `agy` in terminal to start with this compacted context.')
     process.exit(0)
   }
-  const agyfBin = resolveAgyfBin()
-  if (agyfBin) {
-    const res = spawnSync(agyfBin, plain ? ['--plain'] : [], { stdio: 'inherit', cwd })
+  const launcherBin = resolveLauncherBin()
+  if (launcherBin) {
+    const res = spawnSync(launcherBin, plain ? ['--plain'] : [], { stdio: 'inherit', cwd })
     process.exit(res.status ?? 0)
   }
   const agyBin = resolveAgyBin()

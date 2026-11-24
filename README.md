@@ -2,7 +2,7 @@
 
 <img src="assets/logo.svg" alt="agy-fabric logo" width="80" />
 
-# agy-fabric (`agyf`)
+# agy-fabric
 
 **Full Code Mode for Google Antigravity (`agy`)**
 
@@ -24,7 +24,7 @@ context offloading, deterministic 0-LLM compaction, MCP, skills, and parallel `a
 
 ## Why `agy-fabric`?
 
-Stock agent loops spend a model round-trip on every `read_file`, `grep`, `edit`, and `run_command` — and dump every byte of every result into the context window. `agyf` instead runs Antigravity with a minimal system prompt and a **single** tool, `fabric_exec`: a persistent, sandboxed TypeScript kernel that composes file I/O, shell commands, code-graph navigation, context offloading, compaction, MCP servers, skills, and subagents inside one program. Intermediate data stays in the kernel; only the returned value reaches the model.
+Stock agent loops spend a model round-trip on every `read_file`, `grep`, `edit`, and `run_command` — and dump every byte of every result into the context window. `agy-fabric` wraps `agy` to run Antigravity with a minimal system prompt and a **single** tool, `fabric_exec`: a persistent, sandboxed TypeScript kernel that composes file I/O, shell commands, code-graph navigation, context offloading, compaction, MCP servers, skills, and subagents inside one program. Intermediate data stays in the kernel; only the returned value reaches the model.
 
 Powered by [Pi Fabric](https://www.npmjs.com/package/pi-fabric), [Pi Fovea](https://www.npmjs.com/package/pi-fovea), and [Pi Context Engineer](https://github.com/p-yan-6908/pi-context-engineer).
 
@@ -49,10 +49,10 @@ Powered by [Pi Fabric](https://www.npmjs.com/package/pi-fabric), [Pi Fovea](http
   - Replaces raw `Called N MCP tools (fabric_fabric/fabric_exec ×N)` rows, generic `Calling MCP tool...` spinners, and wrapped JSON dumps in `ctrl+o` with live Fabric program names, descriptions, op breakdowns, and durations:
     - Collapsed: `● Fabric · 12 runs  ✓ Read ×14 · Edit ×4 · Bash ×3 · 8.2s  (ctrl+o)`
     - Expanded (`ctrl+o`): `│ ✓ read_pkg · Read ×1 · 11ms` + indented description & op summary
-  - Automatically bypassed in non-TTY / `-p` print mode, or opt out anytime with `agyf --plain` / `AGYF_PLAIN=1`.
-  - Runs agy in its full-screen (alternate screen) rendering mode by default, so the TUI stays intact when the tab is backgrounded or the terminal reflows. Use `agyf --inline` / `AGYF_INLINE=1` (or save a `Rendering Mode` in `/config`) to keep native inline scrollback.
+  - Automatically bypassed in non-TTY / `-p` print mode, or opt out anytime with `agy --plain` / `AGY_FABRIC_PLAIN=1`.
+  - Runs agy in its full-screen (alternate screen) rendering mode by default, so the TUI stays intact when the tab is backgrounded or the terminal reflows. Use `agy --inline` / `AGY_FABRIC_INLINE=1` (or save a `Rendering Mode` in `/config`) to keep native inline scrollback.
 - **Optional Live Telemetry Statusline (`scripts/statusline.sh`)**
-  - Displays model, context %, session tokens, cache hit %, quota, and live Fabric run/op badge (`fabric 2r·2op`) — and feeds live token telemetry into `compact.pressure()`.
+  - Displays model, context %, cumulative session tokens, cache hit % (last turn + session avg), and quota — and feeds live token telemetry into `compact.pressure()`.
 
 ---
 
@@ -75,7 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/p-yan-6908/agy-fabric/main/install.
 Then start a Fabric Code Mode session:
 
 ```bash
-agyf
+agy
 ```
 
 <details>
@@ -98,7 +98,7 @@ To also install the live context telemetry statusline:
 What `install.sh` does:
 1. Installs the Antigravity plugin to `~/.gemini/config/plugins/fabric` (with resolved `bun` and script paths in `mcp_config.json` and `hooks.json`).
 2. Runs `bun install --production` inside the plugin directory to install `pi-fabric`, `pi-fovea`, and `pi-context-engineer`.
-3. Installs `agyf` and `agy-compact` into `~/.local/bin` (override with `--bin-dir`).
+3. Installs `agy` and `agy-compact` into `~/.local/bin` (override with `--bin-dir`), preserving any existing stock `agy` binary at `~/.local/bin/.agy-orig/agy` (restored by `./uninstall.sh`).
 4. Runs `agy plugin validate ~/.gemini/config/plugins/fabric --strict`.
 
 To uninstall:
@@ -113,16 +113,19 @@ To uninstall:
 
 ```bash
 # Start an interactive Fabric Code Mode session (with clean TUI visuals)
-agyf
+agy
 
 # Start without the visual PTY compositor (raw agy output)
-agyf --plain
+agy --plain
 
 # Keep agy's native inline (scrollback) rendering instead of full screen
-agyf --inline
+agy --inline
+
+# Launch stock Antigravity CLI without Fabric Code Mode
+agy --no-fabric
 
 # One-shot prompt mode
-agyf -p="Sketch this repository with Fovea and summarize its entrypoints"
+agy -p="Sketch this repository with Fovea and summarize its entrypoints"
 
 # Deterministic 0-LLM compaction into a fresh session window
 agy-compact
@@ -133,7 +136,7 @@ agy-compact --carry "item"   # add a persistent [Carry Forward] item
 agy-compact --cancel         # cancel a pending staged compaction
 ```
 
-> **Tip:** Inside an active `agyf` session, running `/compact [optional focus]` is intercepted by the `PreInvocation` hook to run `pi-fabric`'s deterministic 0-LLM compactor and stage the summary for `/new`.
+> **Tip:** Inside an active `agy` session, running `/compact [optional focus]` is intercepted by the `PreInvocation` hook to run `pi-fabric`'s deterministic 0-LLM compactor and stage the summary for `/new`.
 
 ---
 
@@ -187,8 +190,11 @@ Example `~/.pi/fabric.json`:
 ### Environment Variables
 
 - `FABRIC_SUBAGENT_MODEL`: Default `--model` flag passed to `agy` subagents spawned via `agents.run` (when unset, subagents inherit `agy`'s active default model).
-- `AGY_BIN`: Override path to the `agy` binary used by `agyf` and `agy-compact`.
+- `AGY_BIN`: Override path to the underlying stock `agy` binary used by the `agy` launcher, `agy-compact`, and `agents.run`.
+- `AGY_FABRIC_PLAIN`: Set to `1` to bypass the PTY visual compositor by default (same as `--plain`).
+- `AGY_FABRIC_INLINE`: Set to `1` to keep inline scrollback rendering instead of full-screen mode (same as `--inline`).
 - `AGY_FABRIC_PLUGIN_DIR`: Override installed plugin directory (default: `~/.gemini/config/plugins/fabric`).
+- `AGY_FABRIC_BIN_DIR`: Override target bin directory for `agy` and `agy-compact` (default: `~/.local/bin`).
 
 ---
 
@@ -242,12 +248,12 @@ Code mode cuts tool calls by **57–66%** at comparable resolve rates (within no
 │   ├── compactor.mjs     # Deterministic 0-LLM transcript compactor
 │   ├── hook-cwd.mjs      # Lifecycle hook handler (PID-isolated session tracking)
 │   ├── run-tracker.mjs   # PID-isolated live run/op telemetry snapshots
-│   ├── tui-proxy.mjs     # Zero-flicker PTY visual compositor for agyf
+│   ├── tui-proxy.mjs     # Zero-flicker PTY visual compositor for agy
 │   ├── vt-screen.mjs     # Lightweight VT100 shadow screen tracker
 │   ├── budget.mjs        # Output clipping helpers
 │   └── resolve-deps.mjs  # Portable package resolver for pi-* dependencies
 ├── bin/
-│   ├── agyf              # `agy --agent fabric` launcher
+│   ├── agy               # `agy --agent fabric` launcher
 │   └── agy-compact       # CLI for deterministic compaction & carry-forward items
 ├── scripts/
 │   └── statusline.sh     # Optional live token telemetry statusline

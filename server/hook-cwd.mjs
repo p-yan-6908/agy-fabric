@@ -2,7 +2,7 @@
 // Lifecycle hook for Fabric plugin:
 // - SessionStart: commits staged deterministic compaction (`pending.json` -> `last-committed.json`)
 //   via `injectSteps` (0 LLM calls).
-// - PreInvocation: intercepts `/compact [instructions]` in both `agy` and `agyf`, running `pi-fabric`'s
+// - PreInvocation: intercepts `/compact [instructions]` in `agy`, running `pi-fabric`'s
 //   deterministic 0-LLM compactor, staging `pending.json`, signaling the PTY wrapper to trigger `/new`
 //   automatically, and returning `terminationBehavior: "terminate"` so `agy`'s LLM compactor never runs.
 // - PreToolUse: refreshes session `cwd` + returns `{"decision":"allow"}`.
@@ -66,7 +66,7 @@ const resolveAgyPid = () => {
       if (!m) break
       const parentPid = Number(m[1])
       const comm = m[2].trim()
-      if (/(?:^|\/)agy$/.test(comm)) return cur
+      if (/(?:^|\/)agy(?:[-.]orig|[-.]real|-bin)?$/.test(comm)) return cur
       cur = parentPid
     } catch {
       break

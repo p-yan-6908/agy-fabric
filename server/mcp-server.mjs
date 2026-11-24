@@ -14,6 +14,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   rmSync,
   statSync,
@@ -68,7 +69,39 @@ const BUN_BIN = findBin('bun', [process.execPath])
 const RG_BIN = findBin('rg')
 const HAS_RG = isAbsolute(RG_BIN) && existsSync(RG_BIN)
 const GREP_BIN = findBin('grep', ['/usr/bin/grep', '/bin/grep'])
-const AGY_BIN = findBin('agy')
+const isFabricLauncher = filePath => {
+  try {
+    const fd = openSync(filePath, 'r')
+    try {
+      const buf = Buffer.alloc(256)
+      const n = readSync(fd, buf, 0, 256, 0)
+      const head = buf.subarray(0, n).toString('utf8')
+      return head.startsWith('#!') && head.includes('agy-fabric-launcher')
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return false
+  }
+}
+
+const findRealAgyBin = () => {
+  const candidates = [
+    process.env.AGY_BIN || '',
+    join(HOME, '.local', 'bin', '.agy-orig', 'agy'),
+    ...PATH_DIRS.flatMap(p => [join(p, '.agy-orig', 'agy'), join(p, 'agy')]),
+    '/opt/homebrew/bin/agy',
+    '/usr/local/bin/agy',
+  ]
+  for (const candidate of candidates) {
+    if (candidate && isAbsolute(candidate) && existsSync(candidate) && !isFabricLauncher(candidate)) {
+      return candidate
+    }
+  }
+  return findBin('agy')
+}
+
+const AGY_BIN = findRealAgyBin()
 const SHELL_BIN =
   ['/bin/zsh', '/usr/bin/zsh', '/bin/bash', '/usr/bin/bash', '/bin/sh'].find(p => existsSync(p)) || '/bin/sh'
 const SANDBOX_EXEC = '/usr/bin/sandbox-exec'
@@ -249,7 +282,7 @@ const resolveOwnerAgyPid = () => {
       if (!m) break
       const parentPid = Number(m[1])
       const comm = m[2].trim()
-      if (/(?:^|\/)agy$/.test(comm)) return cur
+      if (/(?:^|\/)agy(?:[-.]orig|[-.]real|-bin)?$/.test(comm)) return cur
       cur = parentPid
     } catch {
       break

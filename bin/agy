@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# agy-fabric-launcher
+set -euo pipefail
+
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF_PATH="${BASH_SOURCE[0]}"
+
+is_fabric_launcher() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  local magic=""
+  LC_ALL=C IFS= read -r -n 2 magic < "$f" 2>/dev/null || true
+  [ "$magic" = "#!" ] || return 1
+  LC_ALL=C head -n 5 "$f" 2>/dev/null | grep -q 'agy-fabric-launcher'
+}
+
+find_bin() {
+  local name="$1"
+  shift
+  for candidate in "$@"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return 0
+  fi
+  return 1
+}
+
+find_real_agy() {
+  local candidates=()
+  if [ -n "${AGY_BIN:-}" ]; then
+    candidates+=("$AGY_BIN")
+  fi
+  candidates+=(
+    "$SCRIPT_DIR/.agy-orig/agy"
+    "$HOME/.local/bin/.agy-orig/agy"
+  )
+  local ifs_save="$IFS"
+  IFS=":"
+  for dir in $PATH; do
+    [ -n "$dir" ] || continue
+    candidates+=("$dir/.agy-orig/agy" "$dir/agy")
+  done
+  IFS="$ifs_save"
+  candidates+=(
+    "/opt/homebrew/bin/agy"
+    "/usr/local/bin/agy"
+  )
+
+  for candidate in ${candidates[@]+"${candidates[@]}"}; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+      if [ "$candidate" -ef "$SELF_PATH" ]; then
+        continue
+      fi
+      if is_fabric_launcher "$candidate"; then
+        continue
+      fi
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+AGY_PATH="$(find_real_agy)" || {
+  echo "agy: could not find Antigravity CLI binary in PATH or ~/.local/bin/.agy-orig/agy" >&2
+  exit 1
+}
+
+# Parse wrapper flags and pass all other args straight through to agy
+PLAIN="${AGY_FABRIC_PLAIN:-${AGYF_PLAIN:-0}}"
+INLINE="${AGY_FABRIC_INLINE:-${AGYF_INLINE:-0}}"
+NO_FABRIC=0
+HAS_AGENT=0
+AGENT_VALUE=""
+EXPECT_AGENT=0
+SKIP_NEXT_VALUE=0
+END_OF_FLAGS=0
+DIRECT_EXEC=0
+USER_SETTINGS=0
+FIRST_POSITIONAL=""
+PASSTHROUGH=()
+USE_PROXY=1
+
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+  USE_PROXY=0
+fi
+
+for arg in "$@"; do
+  if [ "$EXPECT_AGENT" -eq 1 ]; then
+    EXPECT_AGENT=0
+    AGENT_VALUE="$arg"
+    PASSTHROUGH+=("$arg")
+    continue
+  fi
+  if [ "$SKIP_NEXT_VALUE" -eq 1 ]; then
+    SKIP_NEXT_VALUE=0
+    PASSTHROUGH+=("$arg")
+    continue
+  fi
+  if [ "$END_OF_FLAGS" -eq 1 ]; then
+    [ -z "$FIRST_POSITIONAL" ] && FIRST_POSITIONAL="$arg"
+    PASSTHROUGH+=("$arg")
+    continue
+  fi
+
+  case "$arg" in
+    --)
+      END_OF_FLAGS=1
+      PASSTHROUGH+=("$arg")
+      ;;
+    --plain)
+      PLAIN=1
+      ;;
+    --inline)
+      INLINE=1
+      ;;
+    --no-fabric)
+      NO_FABRIC=1
+      USE_PROXY=0
+      ;;
+    --agent)
+      HAS_AGENT=1
+      EXPECT_AGENT=1
+      PASSTHROUGH+=("$arg")
+      ;;
+    --agent=*)
+      HAS_AGENT=1
+      AGENT_VALUE="${arg#--agent=}"
+      PASSTHROUGH+=("$arg")
+      ;;
+    --settings)
+      USER_SETTINGS=1
+      SKIP_NEXT_VALUE=1
+      PASSTHROUGH+=("$arg")
+      ;;
+    --settings=*)
+      USER_SETTINGS=1
+      PASSTHROUGH+=("$arg")
+      ;;
+    --help|-h|--version|-v)
+      DIRECT_EXEC=1
+      USE_PROXY=0
+      PASSTHROUGH+=("$arg")
+      ;;
+    -p|--print|--prompt|--output-format)
+      USE_PROXY=0
+      SKIP_NEXT_VALUE=1
+      PASSTHROUGH+=("$arg")
+      ;;
+    --print=*|--prompt=*|-p=*|--output-format=*|--remote-control)
+      USE_PROXY=0
+      PASSTHROUGH+=("$arg")
+      ;;
+    --add-dir|--conversation|--effort|-i|--prompt-interactive|--input-format|--json-schema|--log-file|--mode|--model|--print-timeout|--project)
+      SKIP_NEXT_VALUE=1
+      PASSTHROUGH+=("$arg")
+      ;;
+    -*)
+      PASSTHROUGH+=("$arg")
+      ;;
+    *)
+      if [ -z "$FIRST_POSITIONAL" ]; then
+        FIRST_POSITIONAL="$arg"
+        case "$arg" in
+          help|version|plugin|plugins|mcp|models|agent|agents|update|install|changelog|acp|remote-control|mic-serve)
+            DIRECT_EXEC=1
+            USE_PROXY=0
+            ;;
+        esac
+      fi
+      PASSTHROUGH+=("$arg")
+      ;;
+  esac
+done
+
+if [ "$NO_FABRIC" -eq 1 ] || [ "$DIRECT_EXEC" -eq 1 ]; then
+  exec "$AGY_PATH" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+fi
+
+AGENT_ARGS=()
+if [ "$HAS_AGENT" -eq 0 ]; then
+  AGENT_ARGS=(--agent fabric)
+elif [ "$AGENT_VALUE" != "fabric" ]; then
+  USE_PROXY=0
+fi
+
+if [ "$PLAIN" = "1" ] || [ "$USE_PROXY" -eq 0 ]; then
+  exec "$AGY_PATH" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"} ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+fi
+
+PROXY_SCRIPT=""
+for candidate in \
+  "${AGY_FABRIC_PLUGIN_DIR:-}/server/tui-proxy.mjs" \
+  "$(dirname "$SCRIPT_DIR")/server/tui-proxy.mjs" \
+  "$HOME/.gemini/config/plugins/fabric/server/tui-proxy.mjs"
+do
+  if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+    PROXY_SCRIPT="$candidate"
+    break
+  fi
+done
+
+# Full-screen (alternate screen) rendering by default under the compositor.
+# Inline mode repaints with relative cursor moves over scrollback, which desyncs
+# (duplicated/garbled rows) when the terminal reflows or the tab is backgrounded.
+# Opt out with --inline / AGY_FABRIC_INLINE=1, by passing your own --settings, or by
+# saving an explicit `Rendering Mode` (altScreenMode) via /config.
+SETTINGS_FILE="${AGY_SETTINGS_FILE:-$HOME/.gemini/antigravity-cli/settings.json}"
+RENDER_ARGS=()
+if [ "$INLINE" != "1" ] && [ "$USER_SETTINGS" -eq 0 ] \
+  && ! grep -q '"altScreenMode"' "$SETTINGS_FILE" 2>/dev/null; then
+  RENDER_ARGS=(--settings '{"altScreenMode":"always"}')
+fi
+
+BUN_PATH="$(find_bin bun "$HOME/.bun/bin/bun" "/opt/homebrew/bin/bun" "/usr/local/bin/bun" || true)"
+
+if [ -n "$PROXY_SCRIPT" ] && [ -n "$BUN_PATH" ]; then
+  exec "$BUN_PATH" "$PROXY_SCRIPT" "$AGY_PATH" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"} ${RENDER_ARGS[@]+"${RENDER_ARGS[@]}"} ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+fi
+
+exec "$AGY_PATH" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"} ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}

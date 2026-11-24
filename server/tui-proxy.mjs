@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
-// Visual PTY compositor for agyf (Antigravity + Fabric Code Mode).
+// Visual PTY compositor for agy-fabric (Antigravity + Fabric Code Mode).
 // Runs `agy --agent fabric` inside a native Bun PTY, shadows its TUI via VtScreen,
 // and cleanly replaces raw `fabric_fabric/fabric_exec` MCP rows with live, human-readable
 // Fabric program summaries backed by PID-isolated run telemetry.
 //
 // Uses relative cursor movements from the live cursor row so it works identically in both
 // inline terminal mode (at any starting row) and alternate-screen mode.
-// Bypass with --plain or AGYF_PLAIN=1 (or automatically when non-TTY / print mode).
+// Bypass with --plain or AGY_FABRIC_PLAIN=1 (or automatically when non-TTY / print mode).
 
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'

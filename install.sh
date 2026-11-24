@@ -25,14 +25,14 @@ usage() {
   cat <<'EOF'
 Usage: ./install.sh [options]
 
-Install the Fabric Code Mode plugin for Antigravity (agy), plus the `agyf` and
+Install the Fabric Code Mode plugin for Antigravity (agy), plus the `agy` and
 `agy-compact` CLI launchers.
 
 Options:
   --with-statusline     Also install scripts/statusline.sh (feeds live token/context
                         telemetry to compact.pressure()) and print settings.json config
   --plugin-dir <dir>    Target plugin directory (default: ~/.gemini/config/plugins/fabric)
-  --bin-dir <dir>       Target bin directory for agyf/agy-compact (default: ~/.local/bin)
+  --bin-dir <dir>       Target bin directory for agy/agy-compact (default: ~/.local/bin)
   --skip-deps           Skip running `bun install` (if node_modules is already installed)
   -h, --help            Show this help
 EOF
@@ -70,6 +70,15 @@ done
 
 export PATH="$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+is_fabric_launcher() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  local magic=""
+  LC_ALL=C IFS= read -r -n 2 magic < "$f" 2>/dev/null || true
+  [ "$magic" = "#!" ] || return 1
+  LC_ALL=C head -n 5 "$f" 2>/dev/null | grep -q 'agy-fabric-launcher'
+}
+
 find_bun() {
   if command -v bun >/dev/null 2>&1; then
     command -v bun
@@ -89,7 +98,7 @@ BUN_BIN="$(find_bun)" || {
   exit 1
 }
 
-if ! command -v agy >/dev/null 2>&1; then
+if ! command -v agy >/dev/null 2>&1 && [ ! -x "$BIN_DIR/.agy-orig/agy" ]; then
   echo "Warning: 'agy' (Antigravity CLI) not found in PATH yet. Continuing installation..." >&2
 fi
 
@@ -170,9 +179,25 @@ fi
 
 echo "==> Installing CLI launchers to $BIN_DIR"
 mkdir -p "$BIN_DIR"
-cp "$SCRIPT_DIR/bin/agyf" "$BIN_DIR/agyf"
-cp "$SCRIPT_DIR/bin/agy-compact" "$BIN_DIR/agy-compact"
-chmod +x "$BIN_DIR/agyf" "$BIN_DIR/agy-compact"
+
+# Preserve stock Antigravity CLI binary if it currently lives at $BIN_DIR/agy
+if { [ -e "$BIN_DIR/agy" ] || [ -L "$BIN_DIR/agy" ]; } && ! is_fabric_launcher "$BIN_DIR/agy"; then
+  mkdir -p "$BIN_DIR/.agy-orig"
+  rm -f "$BIN_DIR/.agy-orig/agy"
+  mv "$BIN_DIR/agy" "$BIN_DIR/.agy-orig/agy"
+  echo "    Preserved stock agy binary at $BIN_DIR/.agy-orig/agy"
+fi
+
+# Clean up legacy agyf launcher if present
+rm -f "$BIN_DIR/agyf"
+
+cp "$SCRIPT_DIR/bin/agy" "$BIN_DIR/agy.tmp.$$"
+chmod +x "$BIN_DIR/agy.tmp.$$"
+mv -f "$BIN_DIR/agy.tmp.$$" "$BIN_DIR/agy"
+
+cp "$SCRIPT_DIR/bin/agy-compact" "$BIN_DIR/agy-compact.tmp.$$"
+chmod +x "$BIN_DIR/agy-compact.tmp.$$"
+mv -f "$BIN_DIR/agy-compact.tmp.$$" "$BIN_DIR/agy-compact"
 
 if [ "$WITH_STATUSLINE" -eq 1 ]; then
   echo "==> Installing statusline.sh to $STATUSLINE_PATH"
@@ -192,16 +217,22 @@ if [ "$WITH_STATUSLINE" -eq 1 ]; then
 EOF
 fi
 
-if command -v agy >/dev/null 2>&1; then
+if [ -x "$BIN_DIR/.agy-orig/agy" ]; then
+  echo "==> Validating plugin with agy"
+  "$BIN_DIR/.agy-orig/agy" plugin validate "$PLUGIN_DIR" --strict || true
+elif command -v agy >/dev/null 2>&1 && ! is_fabric_launcher "$(command -v agy)"; then
   echo "==> Validating plugin with agy"
   agy plugin validate "$PLUGIN_DIR" --strict || true
+elif [ -x "$BIN_DIR/agy" ]; then
+  echo "==> Validating plugin with agy"
+  "$BIN_DIR/agy" plugin validate "$PLUGIN_DIR" --strict || true
 fi
 
 echo ""
 echo "Done! Launch Fabric Code Mode with:"
-echo "  agyf"
+echo "  agy"
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
   echo ""
   echo "Note: $BIN_DIR is not currently in your PATH. Add this to your shell profile:"
-  echo "  export PATH="$BIN_DIR:$PATH""
+  echo "  export PATH=\"$BIN_DIR:\$PATH\""
 fi

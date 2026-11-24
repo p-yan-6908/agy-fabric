@@ -1,5 +1,5 @@
 // Live run telemetry tracker for agy-fabric.
-// Writes atomic PID-isolated JSON snapshots so the agyf TUI visual compositor and
+// Writes atomic PID-isolated JSON snapshots so the agy-fabric TUI visual compositor and
 // statusline can render real-time Fabric program names, sub-calls, counts, and durations.
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
