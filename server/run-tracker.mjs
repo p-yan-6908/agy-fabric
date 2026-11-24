@@ -89,6 +89,12 @@ export const describeHostCall = (op, args, cwd) => {
     const o = a.options && typeof a.options === 'object' ? a.options : {}
     return { kind: 'memory', verb: 'Recall', label: trimOneLine(o.query || o.entryId || '', 28) }
   }
+  if (op === 'tasks') {
+    const act = String(a.action || 'task')
+    const o = a.options && typeof a.options === 'object' ? a.options : {}
+    const id = o.id || o.taskId || ''
+    return { kind: 'task', verb: 'Task', label: trimOneLine(id ? `${act} ${id}` : act, 30) }
+  }
   if (op === 'skill') {
     return { kind: 'skill', verb: 'Skill', label: trimOneLine(a.name || '', 28) }
   }
@@ -106,7 +112,7 @@ const inferProgramName = (code, display) => {
   if (rawName) return trimOneLine(rawName, 40)
   const rawDesc = typeof display?.description === 'string' ? display.description.trim() : ''
   if (rawDesc) return trimOneLine(rawDesc, 40)
-  const m = /\b(?:pi|extensions|agents|compact|memory|mcp|skills)\.([a-zA-Z0-9_]+)/.exec(String(code || ''))
+  const m = /\b(?:pi|extensions|agents|compact|memory|tasks|bg|mcp|skills)\.([a-zA-Z0-9_]+)/.exec(String(code || ''))
   return m ? m[0] : 'fabric_exec'
 }
 

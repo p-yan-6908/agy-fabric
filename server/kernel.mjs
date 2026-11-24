@@ -96,7 +96,7 @@ const buildProgramEnv = ({ host, runMeta, logs, memState }) => {
                   }
                 }
                 throw new Error(
-                  `${label}.${name} is not available inside fabric_exec; use pi.*, extensions.fovea_*, extensions.ctx_*, compact.*, memory.*, mcp.<server>.<tool>(args), skills.load(name), or agents.run({prompt}).`,
+                  `${label}.${name} is not available inside fabric_exec; use pi.*, extensions.fovea_*, extensions.ctx_*, compact.*, memory.*, tasks.*, mcp.<server>.<tool>(args), skills.load(name), or agents.run({prompt}).`,
                 )
               }
             : undefined,
@@ -189,6 +189,23 @@ const buildProgramEnv = ({ host, runMeta, logs, memState }) => {
   }
   agents.spawn = agents.run
 
+  const normalizeTaskReq = (idOrOpts, extra) => {
+    const ext = extra && typeof extra === 'object' ? extra : {}
+    if (typeof idOrOpts === 'string') return { id: idOrOpts, ...ext }
+    if (idOrOpts && typeof idOrOpts === 'object') return { ...idOrOpts, ...ext }
+    return { ...ext }
+  }
+
+  const tasks = {
+    list: (options = {}) =>
+      host('tasks', { action: 'list', options: typeof options === 'string' ? { status: options } : options ?? {} }),
+    get: (idOrOpts, extra) => host('tasks', { action: 'get', options: normalizeTaskReq(idOrOpts, extra) }),
+    status: (idOrOpts, extra) => host('tasks', { action: 'get', options: normalizeTaskReq(idOrOpts, extra) }),
+    wait: (idOrOpts, extra) => host('tasks', { action: 'wait', options: normalizeTaskReq(idOrOpts, extra) }),
+    stop: (idOrOpts, extra) => host('tasks', { action: 'stop', options: normalizeTaskReq(idOrOpts, extra) }),
+    kill: (idOrOpts, extra) => host('tasks', { action: 'stop', options: normalizeTaskReq(idOrOpts, extra) }),
+  }
+
   const state = {
     async set(key, value) {
       const sk = stateKey(key)
@@ -256,6 +273,11 @@ const buildProgramEnv = ({ host, runMeta, logs, memState }) => {
       if (ref === 'memory.expand' || ref === 'memory.recall') {
         return memory.expand(args)
       }
+      if (ref.startsWith('tasks.') || ref.startsWith('bg.')) {
+        const fn = tasks[ref.slice(ref.indexOf('.') + 1)]
+        if (typeof fn !== 'function') throw new Error(`tools.call: unknown tasks op ${ref}`)
+        return fn(args)
+      }
       if (ref.startsWith('skills.')) {
         return skills.load(ref.slice(7), args?.args)
       }
@@ -271,7 +293,11 @@ const buildProgramEnv = ({ host, runMeta, logs, memState }) => {
   }
 
   const print = (...values) => {
-    logs.push(render(values))
+    const rendered = render(values)
+    logs.push(rendered)
+    if (isWorkerMode && runMeta?.runId) {
+      send({ t: 'log', runId: runMeta.runId, line: rendered })
+    }
   }
   const fabricConsole = { log: print, info: print, warn: print, error: print, debug: print }
 
@@ -293,6 +319,8 @@ const buildProgramEnv = ({ host, runMeta, logs, memState }) => {
     ce,
     compact,
     memory,
+    tasks,
+    bg: tasks,
     tools,
     skills,
     agents,

@@ -5,6 +5,13 @@ All notable changes to `agy-fabric` are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Whole-`fabric_exec` auto-yield (`executor.yieldMs`, default `95000` ms; per-call `yieldMs`, `0` to disable) and unified `tasks.*` (alias `bg.*`) task registry (`tasks.list`, `tasks.get`, `tasks.wait`, `tasks.stop`) in `server/mcp-server.mjs` and `server/kernel.mjs`:
+  - Programs still running at `yieldMs` park their live `kernel.mjs` worker in `taskRegistry` and return `{ yielded: true, status: "running", taskId, activeOps, logsSoFar, outputTail }` so the model refreshes KV-cache TTL or overlaps independent work without interrupting sequential TypeScript execution.
+  - `tasks.wait(id)` automatically clamps each wait slice inside the enclosing `fabric_exec`'s yield window (preventing nested wrapper tasks) and returns the completed program's structured `value` / Context Engineer handle.
+  - `tasks.stop(id)` aborts both the worker and any in-flight `pi.bash` / `agents.run` subprocess process groups, and `pi.bash(cmd, { background: true })` now registers in the same `tasks.*` registry with `details.taskId`.
+
 ### Changed
 
 - Replaced the `agyf` CLI command with `agy` (`bin/agy`) so running `agy` in the

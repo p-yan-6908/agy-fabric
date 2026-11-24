@@ -34,6 +34,7 @@ Powered by [Pi Fabric](https://www.npmjs.com/package/pi-fabric), [Pi Fovea](http
   - Top-level `await` + `return` TypeScript execution in a persistent warm worker process (no cold-start penalty between calls; sandboxed via macOS `sandbox-exec` when available).
   - Composes `pi.read`, `pi.write`, `pi.edit`, `pi.grep`, `pi.find`, `pi.ls`, `pi.bash`, `mcp.<server>.<tool>`, `skills.list/load`, `state.get/set`, and `π` string payloads.
   - Intermediate data stays inside the kernel; only the returned value and `print()` output enter model context.
+  - **Auto-Yield & Unified `tasks.*` Registry:** Programs still running at `yieldMs` (default `95s`; `0` disables) automatically yield `{ yielded: true, taskId }` before KV-cache TTL expiry while the worker continues uninterrupted in the background — inspect, collect, or cancel via `tasks.wait`, `tasks.get`, `tasks.list`, and `tasks.stop` (also tracks `pi.bash(cmd, { background: true })` tasks).
 - **Pi Fovea Code-Graph Navigation (`extensions.fovea_*`)**
   - Heat-ranked repository overviews (`fovea_sketch`), symbol/path/route focus (`fovea_focus`), neighborhood deepening (`fovea_dwell`), and blast-radius impact analysis (`fovea_impact`).
 - **Pi Context Engineer Offloading (`extensions.ctx_*`)**
@@ -150,6 +151,7 @@ All capabilities are exposed as globals inside each `fabric_exec` TypeScript pro
 | **Fovea (`extensions`)** | `extensions.fovea_sketch`, `extensions.fovea_focus`, `extensions.fovea_dwell`, `extensions.fovea_impact` |
 | **Context Engineer (`extensions`)** | `extensions.ctx_read`, `extensions.ctx_summarize`, `extensions.ctx_offload` |
 | **Compaction & Recall** | `compact.pressure`, `compact.carry`, `compact.request`, `compact.status`, `compact.cancel`, `memory.expand` |
+| **Tasks & Auto-Yield (`tasks` / `bg`)** | `tasks.wait`, `tasks.get`, `tasks.list`, `tasks.stop` |
 | **MCP, Skills & Subagents** | `mcp.<server>.<tool>(args)`, `tools.list/search/describe`, `skills.list/load`, `agents.run`, `state.get/set`, `π.<key>` |
 
 ---
@@ -167,6 +169,7 @@ Example `~/.pi/fabric.json`:
 {
   "executor": {
     "timeoutMs": 600000,
+    "yieldMs": 95000,
     "inlineMaxBytes": 8500
   },
   "agents": {

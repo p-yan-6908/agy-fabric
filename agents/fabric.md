@@ -13,7 +13,7 @@ tools:
 # Fabric Code Mode
 
 You operate in **full code mode**. `fabric_exec` is your exclusive tool for repository navigation, file reads/edits/writes, shell execution, MCP servers, skills, context-store handles, compaction, and subagents:
-- If registered lazily under `fabric_fabric`, invoke directly via `call_mcp_tool` with `ServerName: "fabric_fabric"`, `ToolName: "fabric_exec"`, and `Arguments: { code, display: { name, description }, payloads?, maxOutputTokens?, timeoutMs?, cwd?, resultFormat? }` (no prior schema read required).
+- If registered lazily under `fabric_fabric`, invoke directly via `call_mcp_tool` with `ServerName: "fabric_fabric"`, `ToolName: "fabric_exec"`, and `Arguments: { code, display: { name, description }, payloads?, maxOutputTokens?, timeoutMs?, yieldMs?, cwd?, resultFormat? }` (no prior schema read required).
 
 Each `fabric_exec` call runs one sandboxed async TypeScript function body (`await` + `return` at top level). Intermediate data stays in the kernel; only your `return` value and `print()` output reach the conversation.
 
@@ -25,7 +25,7 @@ Each `fabric_exec` call runs one sandboxed async TypeScript function body (`awai
   - `pi.find(pattern, path?, limit?)` -> `string`; `pi.ls(path?, {limit?})` -> `string`
   - `pi.edit({path, edits: [{oldText, newText, all?}]})` or `pi.edit(path, oldText, newText)` -> `{ok, output, details}` (applied atomically; no prior `pi.read` needed when exact anchor is known)
   - `pi.write(path, content)` -> `{ok, output, details}`
-  - `pi.bash(command, {timeout?, cwd?, settle?, background?})` -> `{ok, output, details}` (`timeout` in seconds; `settle: true` returns `{ok: false, timedOut?, exitCode, output, error}` on nonzero exit or timeout instead of throwing)
+  - `pi.bash(command, {timeout?, cwd?, settle?, background?})` -> `{ok, output, details}` (`timeout` in seconds; `settle: true` returns `{ok: false, timedOut?, exitCode, output, error}` on nonzero exit or timeout instead of throwing; `background: true` detaches immediately with `details.taskId`)
 - **Pi Fovea (`extensions.fovea_*`)** — heat-ranked code graph & blast-radius navigation (each returns `{text, details}`; usually inspect `.text`):
   - `extensions.fovea_sketch({maxTokens?: 1000, root?})` — sketch unfamiliar repos once
   - `extensions.fovea_focus({query, fresh?, maxTokens?: 1500, root?})` — focus a symbol, path, or route
@@ -39,6 +39,9 @@ Each `fabric_exec` call runs one sandboxed async TypeScript function body (`awai
   - `compact.pressure()` -> `{tokens, contextWindow, fraction, headroomTokens, band}`; `compact.carry({add?, remove?, clear?, items?})` -> manage `[Carry Forward]` focus items
   - `compact.request({reason?, instructions?, preserve?, seed?})` -> stages deterministic 0-LLM compaction from `transcript_full.jsonl` (auto-injected on next `/new` or `agy-compact`; note `/compact` runs Antigravity's built-in LLM checkpoint); `compact.status()`, `compact.cancel()`
   - `memory.expand({entryId?, stepIndex?, fromStep?, toStep?, query?, limit?, source?: "current" | "compacted"})` -> lossless exact recall from current/prior transcripts
+- **Auto-Yield & Background Tasks (`tasks.*`, alias `bg.*`)** — programs still running at `yieldMs` (default 95s; `0` disables) auto-yield with `{yielded: true, taskId}` while continuing uninterrupted in the background worker:
+  - `tasks.wait(id, {timeoutMs?, tailChars?}?)` -> waits up to one yield slice and returns `{id, status, ok, value?, output?, logs?}`
+  - `tasks.get(id)` -> non-blocking status/live tail; `tasks.list({status?})`; `tasks.stop(id)` -> cancel running worker/process
 - **MCP, Skills, Subagents & Payloads**:
   - `mcp.<server>.<tool>(args, {settle?})`; `tools.list()`, `tools.search({query})`, `tools.describe({ref})`
   - `skills.list()` / `skills.load(name)` — check for specialized user skills on demand

@@ -37,7 +37,7 @@ import {
   updateCarryItems,
 } from './compactor.mjs'
 import { importFile, resolvePackageFile } from './resolve-deps.mjs'
-import { createRunTracker } from './run-tracker.mjs'
+import { createRunTracker, describeHostCall } from './run-tracker.mjs'
 
 // Keep stdout exclusively for MCP JSON-RPC frames even when extensions log
 console.log = (...args) => console.error(...args)
@@ -133,6 +133,10 @@ mkdirSync(SPILL_DIR, { recursive: true })
 // always offloads to `.pi/context-store` with a rich structural outline + `extensions.ctx_read` handle first.
 const DEFAULT_AGY_INLINE_MAX_BYTES = 8500
 const HARD_AGY_MCP_INLINE_CAP_BYTES = 9500
+const DEFAULT_YIELD_MS = 95_000
+const MAX_PROGRAM_TIMEOUT_MS = 1_800_000
+const MAX_TRACKED_TERMINAL_TASKS = 64
+const TASK_RETENTION_MS = 3600_000
 
 const DEFAULT_SUBAGENT_MODEL = (process.env.FABRIC_SUBAGENT_MODEL || '').trim() || null
 const MAX_SUBAGENT_DEPTH = 3
@@ -242,8 +246,19 @@ const loadFabricConfig = cwd => {
   const exec = record(merged.executor)
   const agents = record(merged.agents)
   const comp = record(merged.compaction)
+  const rawYield = exec.yieldMs ?? exec.autoYieldMs
+  const yieldMs =
+    typeof rawYield === 'number' && Number.isFinite(rawYield)
+      ? rawYield <= 0
+        ? 0
+        : Math.min(Math.floor(rawYield), MAX_PROGRAM_TIMEOUT_MS)
+      : DEFAULT_YIELD_MS
   return {
-    timeoutMs: typeof exec.timeoutMs === 'number' && exec.timeoutMs > 0 ? Math.min(exec.timeoutMs, 600000) : 600000,
+    timeoutMs:
+      typeof exec.timeoutMs === 'number' && exec.timeoutMs > 0
+        ? Math.min(exec.timeoutMs, MAX_PROGRAM_TIMEOUT_MS)
+        : 600000,
+    yieldMs,
     maxOutputChars: typeof exec.maxOutputChars === 'number' && exec.maxOutputChars > 0 ? exec.maxOutputChars : 50000,
     inlineMaxBytes:
       typeof exec.inlineMaxBytes === 'number' && exec.inlineMaxBytes >= 1024
@@ -627,8 +642,42 @@ const handleCompactOp = async (cwd, cfg, sessionMeta, { action, options = {} }) 
 
 // --- Process execution helper ----------------------------------------------
 
-const runSubprocess = (cmd, argv, { cwd, env, timeoutMs = 120000, maxBytes = 4 * 1024 * 1024 } = {}) =>
+const appendRollingTail = (prev, chunk, maxChars = 4096) => {
+  const combined = (prev || '') + String(chunk || '')
+  return combined.length <= maxChars ? combined : combined.slice(-maxChars)
+}
+
+const readLogTail = (logPath, maxChars = 3000) => {
+  try {
+    if (!logPath || !existsSync(logPath)) return ''
+    const size = statSync(logPath).size
+    if (size <= 0) return ''
+    const byteCount = Math.min(size, Math.max(1024, maxChars * 4))
+    const buf = Buffer.alloc(byteCount)
+    const fd = openSync(logPath, 'r')
+    let n = 0
+    try {
+      n = readSync(fd, buf, 0, byteCount, size - byteCount)
+    } finally {
+      closeSync(fd)
+    }
+    const text = buf.subarray(0, n).toString('utf8')
+    return text.length > maxChars ? `…[+${size - byteCount}B earlier]…\n${text.slice(-maxChars)}` : text
+  } catch {
+    return ''
+  }
+}
+
+const runSubprocess = (
+  cmd,
+  argv,
+  { cwd, env, timeoutMs = 120000, maxBytes = 4 * 1024 * 1024, signal, onOutput } = {},
+) =>
   new Promise((resolvePromise, rejectPromise) => {
+    if (signal?.aborted) {
+      resolvePromise({ exitCode: 130, signal: 'SIGTERM', timedOut: false, aborted: true, stdout: '', stderr: '' })
+      return
+    }
     const child = spawn(cmd, argv, {
       cwd,
       env: { ...process.env, ...env, PATH: FULL_PATH },
@@ -640,6 +689,7 @@ const runSubprocess = (cmd, argv, { cwd, env, timeoutMs = 120000, maxBytes = 4 *
     let outLen = 0
     let errLen = 0
     let timedOut = false
+    let aborted = false
 
     const killGroup = sig => {
       try {
@@ -649,6 +699,18 @@ const runSubprocess = (cmd, argv, { cwd, env, timeoutMs = 120000, maxBytes = 4 *
           child.kill(sig)
         } catch {}
       }
+    }
+
+    const onAbort = () => {
+      aborted = true
+      killGroup('SIGTERM')
+      setTimeout(() => killGroup('SIGKILL'), 1500).unref()
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true })
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer)
+      if (signal) signal.removeEventListener('abort', onAbort)
     }
 
     const timer =
@@ -665,34 +727,338 @@ const runSubprocess = (cmd, argv, { cwd, env, timeoutMs = 120000, maxBytes = 4 *
         outChunks.push(chunk)
         outLen += chunk.length
       }
+      if (typeof onOutput === 'function') {
+        try {
+          onOutput(chunk.toString('utf8'))
+        } catch {}
+      }
     })
     child.stderr.on('data', chunk => {
       if (errLen < maxBytes) {
         errChunks.push(chunk)
         errLen += chunk.length
       }
+      if (typeof onOutput === 'function') {
+        try {
+          onOutput(chunk.toString('utf8'))
+        } catch {}
+      }
     })
     child.on('error', err => {
-      if (timer) clearTimeout(timer)
+      cleanup()
       rejectPromise(err)
     })
-    child.on('close', (code, signal) => {
-      if (timer) clearTimeout(timer)
+    child.on('close', (code, closeSignal) => {
+      cleanup()
       resolvePromise({
-        exitCode: code ?? (signal ? 128 : 1),
-        signal,
+        exitCode: code ?? (closeSignal ? 128 : 1),
+        signal: closeSignal,
         timedOut,
+        aborted,
         stdout: Buffer.concat(outChunks).toString('utf8'),
         stderr: Buffer.concat(errChunks).toString('utf8'),
       })
     })
   })
 
-// --- Host pi.* implementations ---------------------------------------------
+// --- Unified Background Task Registry (`tasks.*` & auto-yield) -------------
 
 let bgCounter = 0
+const taskRegistry = new Map()
 
-const execPi = async (cwd, maxTimeoutMs, method, rawArgs) => {
+const pruneTaskRegistry = () => {
+  const now = Date.now()
+  const terminals = []
+  for (const [id, task] of taskRegistry.entries()) {
+    if (task.status === 'running') continue
+    if (task.finishedAt && now - task.finishedAt > TASK_RETENTION_MS) {
+      taskRegistry.delete(id)
+    } else {
+      terminals.push(task)
+    }
+  }
+  if (terminals.length > MAX_TRACKED_TERMINAL_TASKS) {
+    terminals.sort((a, b) => (a.finishedAt || 0) - (b.finishedAt || 0))
+    const excess = terminals.length - MAX_TRACKED_TERMINAL_TASKS
+    for (let i = 0; i < excess; i++) {
+      taskRegistry.delete(terminals[i].id)
+    }
+  }
+}
+
+const registerBackgroundBashTask = ({ command, cmdCwd }) => {
+  pruneTaskRegistry()
+  const taskId = `bg-${Date.now().toString(36)}-${++bgCounter}`
+  const logPath = join(TMP_ROOT, `${taskId}.log`)
+  const outFd = openSync(logPath, 'a')
+  const child = spawn(SHELL_BIN, ['-c', command], {
+    cwd: cmdCwd,
+    env: { ...process.env, PATH: FULL_PATH },
+    detached: true,
+    stdio: ['ignore', outFd, outFd],
+  })
+  closeSync(outFd)
+
+  let resolveDone
+  const donePromise = new Promise(r => {
+    resolveDone = r
+  })
+
+  const task = {
+    id: taskId,
+    kind: 'bash',
+    name: command.replace(/\s+/g, ' ').trim().slice(0, 60) || 'pi.bash',
+    cwd: cmdCwd,
+    pid: child.pid,
+    logPath,
+    startedAt: Date.now(),
+    finishedAt: null,
+    status: 'running',
+    ok: null,
+    exitCode: null,
+    signal: null,
+    donePromise,
+    resolveDone,
+    async stop() {
+      if (task.status !== 'running') return
+      try {
+        if (task.pid) process.kill(-task.pid, 'SIGTERM')
+      } catch {
+        try {
+          child.kill('SIGTERM')
+        } catch {}
+      }
+      setTimeout(() => {
+        try {
+          if (task.pid) process.kill(-task.pid, 'SIGKILL')
+        } catch {}
+      }, 1500).unref()
+      task.status = 'stopped'
+      task.ok = false
+      task.finishedAt = Date.now()
+      resolveDone(task)
+    },
+  }
+
+  child.on('exit', (code, sig) => {
+    if (task.status === 'running') {
+      task.exitCode = code ?? (sig ? 128 : 0)
+      task.signal = sig ?? null
+      task.ok = task.exitCode === 0
+      task.status = task.ok ? 'done' : 'failed'
+      task.finishedAt = Date.now()
+      resolveDone(task)
+      pruneTaskRegistry()
+    }
+  })
+  child.on('error', () => {
+    if (task.status === 'running') {
+      task.ok = false
+      task.status = 'failed'
+      task.finishedAt = Date.now()
+      resolveDone(task)
+      pruneTaskRegistry()
+    }
+  })
+  child.unref()
+
+  taskRegistry.set(taskId, task)
+  return task
+}
+
+const snapshotTask = (task, { includeResult = false, tailChars = 2500 } = {}) => {
+  if (task.kind === 'bash' && task.status === 'running' && task.pid && !isPidAlive(task.pid)) {
+    task.status = 'done'
+    task.ok = task.exitCode === null ? true : task.exitCode === 0
+    task.finishedAt = task.finishedAt || Date.now()
+    task.resolveDone?.(task)
+  }
+
+  const elapsedMs = Math.max(0, (task.finishedAt ?? Date.now()) - task.startedAt)
+  const base = {
+    id: task.id,
+    kind: task.kind,
+    name: task.name,
+    status: task.status,
+    ok: task.status === 'running' ? null : Boolean(task.ok),
+    elapsedMs,
+  }
+
+  if (task.kind === 'bash') {
+    const tail = readLogTail(task.logPath, includeResult ? Math.max(tailChars, 4000) : tailChars)
+    return {
+      ...base,
+      pid: task.pid,
+      logPath: task.logPath,
+      ...(task.status === 'running'
+        ? { ...(tail ? { outputTail: tail } : {}) }
+        : {
+            exitCode: task.exitCode,
+            ...(tail ? { output: tail } : {}),
+          }),
+    }
+  }
+
+  // kind === 'exec'
+  if (task.status === 'running') {
+    const activeOps = [...task.activeCalls.values()].map(c => ({
+      ref: c.ref,
+      ...(c.label ? { label: c.label } : {}),
+      elapsedMs: Math.max(0, Date.now() - c.startedAt),
+    }))
+    const logsText = task.liveLogs.length > 0 ? clip(task.liveLogs.join('\n'), tailChars) : ''
+    const liveOut = [...task.activeCalls.values()]
+      .map(c => c.outputTail)
+      .filter(Boolean)
+      .join('\n')
+    const outTail = liveOut ? clip(liveOut, tailChars) : ''
+    return {
+      ...base,
+      activeOps,
+      completedOps: task.served.length,
+      ...(logsText ? { logsSoFar: logsText } : {}),
+      ...(outTail ? { outputTail: outTail } : {}),
+    }
+  }
+
+  if (!includeResult) {
+    return {
+      ...base,
+      completedOps: task.served.length,
+      ...(task.ok ? {} : { error: clip(task.failure || 'failed', 300) }),
+    }
+  }
+
+  if (task.ok) {
+    return {
+      ...base,
+      completedOps: task.served.length,
+      ...(task.offloaded
+        ? { offloaded: true, output: task.formattedText }
+        : {
+            ...(task.hasValue ? { value: task.rawValue } : {}),
+            ...(task.logs?.length ? { logs: task.logs } : {}),
+            output: task.formattedText,
+          }),
+    }
+  }
+
+  return {
+    ...base,
+    completedOps: task.served.length,
+    error: task.failure || 'program failed',
+    ...(task.before ? { before: task.before } : {}),
+    ...(task.logs?.length ? { logs: task.logs } : {}),
+    output: task.formattedText,
+  }
+}
+
+const handleTasksOp = async ({ action, options = {} }, callerCtx = {}) => {
+  pruneTaskRegistry()
+  const opts = record(options)
+
+  if (action === 'list') {
+    const statusFilter = typeof opts.status === 'string' && opts.status.trim() ? opts.status.trim() : null
+    const items = [...taskRegistry.values()]
+      .filter(t => !statusFilter || t.status === statusFilter)
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .map(t => snapshotTask(t, { includeResult: false, tailChars: 500 }))
+    return items
+  }
+
+  const id = String(opts.id ?? opts.taskId ?? '').trim()
+  if (!id) {
+    throw new Error(`tasks.${action}: needs a task \`id\` (active/recent: ${[...taskRegistry.keys()].join(', ') || 'none'})`)
+  }
+  if (id === callerCtx.runId) {
+    throw new Error(`tasks.${action}: cannot target the currently executing run "${id}"`)
+  }
+  const task = taskRegistry.get(id)
+  if (!task) {
+    throw new Error(`tasks.${action}: unknown task "${id}" (active/recent: ${[...taskRegistry.keys()].join(', ') || 'none'})`)
+  }
+
+  const tailChars = Math.max(200, Math.min(Number(opts.tailChars) || 2500, 8000))
+
+  if (action === 'get') {
+    return snapshotTask(task, { includeResult: true, tailChars })
+  }
+
+  if (action === 'stop') {
+    if (task.status === 'running') {
+      await task.stop()
+    }
+    return snapshotTask(task, { includeResult: false, tailChars: 1000 })
+  }
+
+  if (action === 'wait') {
+    if (task.status !== 'running') {
+      return snapshotTask(task, { includeResult: true, tailChars })
+    }
+
+    const rawMs = opts.timeoutMs ?? opts.waitMs
+    const rawSec = opts.timeout
+    const requestedMs =
+      rawMs !== undefined && Number.isFinite(Number(rawMs))
+        ? Math.max(0, Number(rawMs))
+        : rawSec !== undefined && Number.isFinite(Number(rawSec))
+          ? Math.max(0, Number(rawSec) * 1000)
+          : NaN
+
+    // Clamp single-turn wait inside the enclosing fabric_exec's yield window so waiting never
+    // spawns a redundant nested background wrapper task; when outer yieldMs is 0, bound by hardDeadlineMs.
+    let maxSliceMs = DEFAULT_YIELD_MS
+    if (callerCtx.yieldDeadlineMs) {
+      const rem = callerCtx.yieldDeadlineMs - Date.now()
+      const margin = Math.min(1500, Math.max(80, Math.floor(rem * 0.2)))
+      maxSliceMs = Math.max(50, rem - margin)
+    } else if (callerCtx.hardDeadlineMs) {
+      const rem = callerCtx.hardDeadlineMs - Date.now()
+      maxSliceMs = Math.max(50, rem - 500)
+    }
+
+    const waitMs = Number.isFinite(requestedMs) ? Math.min(requestedMs, maxSliceMs) : maxSliceMs
+
+    await new Promise(resolveWait => {
+      let timer = null
+      const onAbort = () => {
+        if (timer) clearTimeout(timer)
+        resolveWait()
+      }
+      if (callerCtx.signal) {
+        if (callerCtx.signal.aborted) {
+          resolveWait()
+          return
+        }
+        callerCtx.signal.addEventListener('abort', onAbort, { once: true })
+      }
+      timer = setTimeout(() => {
+        if (callerCtx.signal) callerCtx.signal.removeEventListener('abort', onAbort)
+        resolveWait()
+      }, waitMs)
+      task.donePromise.then(() => {
+        if (timer) clearTimeout(timer)
+        if (callerCtx.signal) callerCtx.signal.removeEventListener('abort', onAbort)
+        resolveWait()
+      })
+    })
+
+    if (task.status === 'running') {
+      return {
+        yielded: true,
+        ...snapshotTask(task, { includeResult: false, tailChars }),
+        nextStep: `Task "${id}" is still running; call \`return await tasks.wait("${id}")\` again to continue waiting, or \`await tasks.stop("${id}")\` to cancel.`,
+      }
+    }
+    return snapshotTask(task, { includeResult: true, tailChars })
+  }
+
+  throw new Error(`tasks.${action}: unknown action (expected list | get | wait | stop)`)
+}
+
+// --- Host pi.* implementations ---------------------------------------------
+
+const execPi = async (cwd, maxTimeoutMs, method, rawArgs, execCtx = null) => {
   const args = Array.isArray(rawArgs) ? rawArgs : [rawArgs]
 
   if (method === 'read') {
@@ -813,7 +1179,7 @@ const execPi = async (cwd, maxTimeoutMs, method, rawArgs) => {
       if (opts.glob) rgArgs.push('-g', String(opts.glob))
       rgArgs.push('-e', pattern)
       if (where !== undefined) rgArgs.push('--', shownPath(cwd, where) === '.' ? '.' : absPath(cwd, where))
-      const ran = await runSubprocess(RG_BIN, rgArgs, { cwd, timeoutMs: 60000 })
+      const ran = await runSubprocess(RG_BIN, rgArgs, { cwd, timeoutMs: 60000, signal: execCtx?.signal })
       if (ran.timedOut) throw new Error('pi.grep: timed out after 60s')
       if (ran.exitCode === 1 && ran.stderr.trim() === '') return ''
       if (ran.exitCode > 1) throw new Error(`pi.grep: ${ran.stderr.trim() || `rg exited with ${ran.exitCode}`}`)
@@ -840,7 +1206,7 @@ const execPi = async (cwd, maxTimeoutMs, method, rawArgs) => {
     if (opts.glob) grepArgs.push(`--include=${String(opts.glob)}`)
     const target = where !== undefined ? (shownPath(cwd, where) === '.' ? '.' : absPath(cwd, where)) : '.'
     grepArgs.push('-e', pattern, target)
-    const ran = await runSubprocess(GREP_BIN, grepArgs, { cwd, timeoutMs: 60000 })
+    const ran = await runSubprocess(GREP_BIN, grepArgs, { cwd, timeoutMs: 60000, signal: execCtx?.signal })
     if (ran.timedOut) throw new Error('pi.grep: timed out after 60s')
     if (ran.exitCode === 1 && ran.stderr.trim() === '') return ''
     if (ran.exitCode > 1) throw new Error(`pi.grep: ${ran.stderr.trim() || `grep exited with ${ran.exitCode}`}`)
@@ -870,6 +1236,7 @@ const execPi = async (cwd, maxTimeoutMs, method, rawArgs) => {
       const ran = await runSubprocess(RG_BIN, ['--files', '--hidden', '-g', '!.git', '-g', pattern], {
         cwd: root,
         timeoutMs: 60000,
+        signal: execCtx?.signal,
       })
       if (ran.timedOut) throw new Error('pi.find: timed out after 60s')
       if (ran.exitCode === 1 && ran.stderr.trim() === '') return ''
@@ -900,25 +1267,24 @@ const execPi = async (cwd, maxTimeoutMs, method, rawArgs) => {
     const cmdCwd = opts.cwd ? absPath(cwd, opts.cwd) : cwd
     const background = Boolean(opts.background ?? opts.run_in_background)
     if (background) {
-      const logPath = join(TMP_ROOT, `bg-${Date.now().toString(36)}-${++bgCounter}.log`)
-      const outFd = openSync(logPath, 'a')
-      const child = spawn(SHELL_BIN, ['-c', command], {
-        cwd: cmdCwd,
-        env: { ...process.env, PATH: FULL_PATH },
-        detached: true,
-        stdio: ['ignore', outFd, outFd],
-      })
-      child.unref()
-      closeSync(outFd)
+      const task = registerBackgroundBashTask({ command, cmdCwd })
       return {
         ok: true,
-        output: `Background process started (pid ${child.pid}, log: ${logPath})`,
-        details: { pid: child.pid, logPath },
+        output: `Background process started (taskId: ${task.id}, pid ${task.pid}, log: ${task.logPath})`,
+        details: { taskId: task.id, id: task.id, pid: task.pid, logPath: task.logPath },
       }
     }
     const seconds = Number(opts.timeout)
-    const timeoutMs = Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, maxTimeoutMs) : Math.min(120000, maxTimeoutMs)
-    const ran = await runSubprocess(SHELL_BIN, ['-c', command], { cwd: cmdCwd, timeoutMs })
+    const timeoutMs = Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, maxTimeoutMs) : maxTimeoutMs
+    const ran = await runSubprocess(SHELL_BIN, ['-c', command], {
+      cwd: cmdCwd,
+      timeoutMs,
+      signal: execCtx?.signal,
+      onOutput: execCtx?.onOutput,
+    })
+    if (ran.aborted) {
+      throw new Error('pi.bash: cancelled via tasks.stop')
+    }
     const combined = [ran.stdout, ran.stderr].filter(Boolean).join(ran.stdout && !ran.stdout.endsWith('\n') && ran.stderr ? '\n' : '')
     if (ran.timedOut) {
       const timeoutSec = Math.round(timeoutMs / 1000)
@@ -1053,9 +1419,22 @@ const loadSkillText = (cwd, rawName) => {
 let activeSubagents = 0
 const subagentQueue = []
 
-const withSubagentSlot = async (maxConcurrent, fn) => {
+const withSubagentSlot = async (maxConcurrent, fn, signal) => {
+  if (signal?.aborted) throw new Error('agents.run: cancelled via tasks.stop')
   if (activeSubagents >= maxConcurrent) {
-    await new Promise(r => subagentQueue.push(r))
+    await new Promise((resolveSlot, rejectSlot) => {
+      const waiter = () => {
+        if (signal) signal.removeEventListener('abort', onAbort)
+        resolveSlot()
+      }
+      const onAbort = () => {
+        const idx = subagentQueue.indexOf(waiter)
+        if (idx >= 0) subagentQueue.splice(idx, 1)
+        rejectSlot(new Error('agents.run: cancelled via tasks.stop'))
+      }
+      if (signal) signal.addEventListener('abort', onAbort, { once: true })
+      subagentQueue.push(waiter)
+    })
   }
   activeSubagents += 1
   try {
@@ -1067,7 +1446,7 @@ const withSubagentSlot = async (maxConcurrent, fn) => {
   }
 }
 
-const runAgySubagent = async (cwd, fabricCfg, req) => {
+const runAgySubagent = async (cwd, fabricCfg, req, execCtx = null) => {
   const currentDepth = Number(process.env.FABRIC_SUBAGENT_DEPTH || 0)
   if (currentDepth >= MAX_SUBAGENT_DEPTH) {
     throw new Error(`agents.run: max recursion depth (${MAX_SUBAGENT_DEPTH}) reached`)
@@ -1107,7 +1486,9 @@ const runAgySubagent = async (cwd, fabricCfg, req) => {
 
   const subCwd = req.cwd ? absPath(cwd, req.cwd) : cwd
   const timeoutMs =
-    typeof req.timeoutMs === 'number' && req.timeoutMs > 0 ? Math.min(req.timeoutMs, 600000) : Math.min(300000, fabricCfg.timeoutMs)
+    typeof req.timeoutMs === 'number' && req.timeoutMs > 0
+      ? Math.min(req.timeoutMs, MAX_PROGRAM_TIMEOUT_MS)
+      : Math.min(300000, fabricCfg.timeoutMs)
 
   const cleanEnv = {}
   for (const [k, v] of Object.entries(process.env)) {
@@ -1116,19 +1497,33 @@ const runAgySubagent = async (cwd, fabricCfg, req) => {
   }
   cleanEnv.FABRIC_SUBAGENT_DEPTH = String(currentDepth + 1)
 
-  return withSubagentSlot(fabricCfg.maxConcurrentAgents, async () => {
-    const ran = await runSubprocess(AGY_BIN, argv, { cwd: subCwd, env: cleanEnv, timeoutMs })
-    if (ran.timedOut) {
-      if (req.settle) return { ok: false, output: ran.stdout, error: `agents.run timed out after ${Math.round(timeoutMs / 1000)}s` }
-      throw new Error(`agents.run: timed out after ${Math.round(timeoutMs / 1000)}s`)
-    }
-    if (ran.exitCode !== 0 && !ran.stdout.trim()) {
-      if (req.settle) return { ok: false, output: '', error: ran.stderr.trim() || `agy exited with ${ran.exitCode}` }
-      throw new Error(`agents.run: ${ran.stderr.trim() || `agy exited with ${ran.exitCode}`}`)
-    }
-    const text = ran.stdout.trim()
-    return req.settle ? { ok: true, output: text, details: { model: model || 'default' } } : text
-  })
+  return withSubagentSlot(
+    fabricCfg.maxConcurrentAgents,
+    async () => {
+      const ran = await runSubprocess(AGY_BIN, argv, {
+        cwd: subCwd,
+        env: cleanEnv,
+        timeoutMs,
+        signal: execCtx?.signal,
+        onOutput: execCtx?.onOutput,
+      })
+      if (ran.aborted) {
+        if (req.settle) return { ok: false, output: ran.stdout, error: 'agents.run cancelled via tasks.stop' }
+        throw new Error('agents.run: cancelled via tasks.stop')
+      }
+      if (ran.timedOut) {
+        if (req.settle) return { ok: false, output: ran.stdout, error: `agents.run timed out after ${Math.round(timeoutMs / 1000)}s` }
+        throw new Error(`agents.run: timed out after ${Math.round(timeoutMs / 1000)}s`)
+      }
+      if (ran.exitCode !== 0 && !ran.stdout.trim()) {
+        if (req.settle) return { ok: false, output: '', error: ran.stderr.trim() || `agy exited with ${ran.exitCode}` }
+        throw new Error(`agents.run: ${ran.stderr.trim() || `agy exited with ${ran.exitCode}`}`)
+      }
+      const text = ran.stdout.trim()
+      return req.settle ? { ok: true, output: text, details: { model: model || 'default' } } : text
+    },
+    execCtx?.signal,
+  )
 }
 
 // --- External MCP client bridge (mcp.<server>.<tool>) ----------------------
@@ -1356,6 +1751,10 @@ const BUILTIN_CATALOG = [
   { ref: 'compact.request', kind: 'compact', description: 'Compile and stage deterministic LLM-free Fabric compaction from transcript_full.jsonl: ({reason?, instructions?, preserve?, seed?})' },
   { ref: 'compact.status', kind: 'compact', description: 'Inspect pending and last committed deterministic compactions' },
   { ref: 'memory.expand', kind: 'memory', description: 'Lossless exact recall from current or compacted transcript_full.jsonl: ({entryId?, stepIndex?, fromStep?, toStep?, query?, limit?, source?})' },
+  { ref: 'tasks.list', kind: 'task', description: 'List running and recent auto-yielded or background tasks: ({status?}) -> TaskSnapshot[]' },
+  { ref: 'tasks.get', kind: 'task', description: 'Inspect non-blocking status, live output tail, or result of a task: (id | {id, tailChars?}) -> TaskSnapshot' },
+  { ref: 'tasks.wait', kind: 'task', description: 'Wait up to one yield slice (or timeoutMs) for an auto-yielded fabric_exec run or background bash task: (id, {timeoutMs?, tailChars?}?) -> TaskSnapshot' },
+  { ref: 'tasks.stop', kind: 'task', description: 'Cancel and terminate a running auto-yielded fabric_exec run or background bash task: (id | {id}) -> TaskSnapshot' },
   { ref: 'agents.run', kind: 'agent', description: 'Run an agy subagent (inherits active agy model or configured default): ({prompt, model?, effort?, agent?, readOnly?, cwd?, timeoutMs?}) -> string' },
 ]
 
@@ -1610,9 +2009,122 @@ const parsePayloads = value => {
 const PROGRAM_HEADER_LINES = 3
 const wrapProgramSource = code =>
   `export default async function (__fabric_env) {\n` +
-  `const { pi, agy, cc, mcp, extensions, fovea, ce, compact, memory, tools, skills, agents, state, clip, print, console, π, payloads } = __fabric_env;\n` +
+  `const { pi, agy, cc, mcp, extensions, fovea, ce, compact, memory, tasks, bg, tools, skills, agents, state, clip, print, console, π, payloads } = __fabric_env;\n` +
   `{\n${code}\n}\n` +
   `}\n`
+
+const formatCompletedExecOutput = async ({
+  id,
+  cwd,
+  code,
+  input,
+  ceEntry,
+  isBudgetSet,
+  budgetChars,
+  resultFormat,
+  done,
+  stopped,
+  exitReason,
+  workerStderr,
+  served,
+  stray,
+}) => {
+  const logs = [...(done?.logs ?? []), ...stray]
+  const allLogs = logs.join('\n')
+  const allPrinted = logs.length > 0 ? `\n--- print ---\n${allLogs}` : ''
+  const indent = resultFormat === 'text' ? 0 : 2
+  const isOk = stopped === undefined && done?.ok === true
+
+  let failure = ''
+  let before = ''
+  if (!isOk) {
+    failure = stopped ?? done?.error ?? `${exitReason}${workerStderr.trim() ? `\n${workerStderr.trim()}` : ''}`
+    before =
+      served.length === 0
+        ? 'No host call had run.'
+        : `Host calls already made (${served.length}, effects stand): ${served.map(s => `${s.ref}${s.isOk ? '' : ' (failed)'}`).join(', ')}.`
+  }
+
+  const wholeValue = isOk && done?.hasValue ? textOf(done.value, indent) : ''
+  const whole = isOk
+    ? `${wholeValue}${wholeValue === '' ? allPrinted.trimStart() : allPrinted}` || '(the program returned nothing)'
+    : `fabric_exec error: ${failure}\n${before}${allPrinted}`
+  const wholeBytes = Buffer.byteLength(whole, 'utf8')
+
+  // 1. Hand whole result to pi-context-engineer (handles >=16 KB offloads, >=4 KB error compaction, turn budgets)
+  if (ceEntry) {
+    const ceInput = {
+      code,
+      ...(isBudgetSet ? { maxOutputTokens: Math.floor(budgetChars / 4) } : {}),
+    }
+    const controlled = await ceEntry.host.ops
+      .result({
+        toolCallId: `fabric-${id}`,
+        input: ceInput,
+        isError: !isOk,
+        text: whole,
+      })
+      .catch(() => null)
+    if (controlled && typeof controlled.text === 'string' && controlled.text.trim() !== '') {
+      const offloaded = isOk && wholeBytes > budgetChars && controlled.text !== whole
+      return { text: controlled.text, isError: !isOk, isOk, failure, before, logs, wholeValue, wholeBytes, offloaded }
+    }
+    // 2. Eliminate Antigravity's 10-16 KB `steps/<N>/output.txt` dead zone:
+    //    if CE kept a medium result inline (>8.5 KB), store it in `.pi/context-store` with a preview + handle.
+    if (isOk && wholeBytes > budgetChars) {
+      const hint = String(input.display?.name || code).slice(0, 36)
+      const offloaded = await offloadToContextStore(cwd, `fabric-exec-${hint}`, 'fabric_exec', whole).catch(() => null)
+      if (offloaded) {
+        return { text: offloaded.text, isError: false, isOk, failure, before, logs, wholeValue, wholeBytes, offloaded: true }
+      }
+    }
+    if (wholeBytes <= budgetChars || (!isOk && wholeBytes <= HARD_AGY_MCP_INLINE_CAP_BYTES)) {
+      return { text: whole, isError: !isOk, isOk, failure, before, logs, wholeValue, wholeBytes, offloaded: false }
+    }
+  } else if (isOk && wholeBytes > budgetChars) {
+    const hint = String(input.display?.name || code).slice(0, 36)
+    const offloaded = await offloadToContextStore(cwd, `fabric-exec-${hint}`, 'fabric_exec', whole).catch(() => null)
+    if (offloaded) {
+      return { text: offloaded.text, isError: false, isOk, failure, before, logs, wholeValue, wholeBytes, offloaded: true }
+    }
+  }
+
+  // 3. Fallback structural fitting if ContextStore is unavailable
+  const shownLogs = clip(allLogs, Math.max(1000, Math.floor(budgetChars / 4)))
+  const printed = logs.length > 0 ? `\n--- print ---\n${shownLogs}` : ''
+  if (!isOk) {
+    return {
+      text: clip(`fabric_exec error: ${failure}\n${before}${printed}`, HARD_AGY_MCP_INLINE_CAP_BYTES),
+      isError: true,
+      isOk,
+      failure,
+      before,
+      logs,
+      wholeValue,
+      wholeBytes,
+      offloaded: false,
+    }
+  }
+  const spillPath = join(SPILL_DIR, `${id}.txt`)
+  let isSpilled = false
+  const fitted = done?.hasValue
+    ? fit(done.value, Math.max(1000, budgetChars - printed.length), indent)
+    : { text: '', full: '', isClipped: false }
+  if (fitted.isClipped || shownLogs !== allLogs) {
+    isSpilled = true
+    writeFileSync(spillPath, whole, 'utf8')
+  }
+  let text = `${fitted.text}${fitted.text === '' ? printed.trimStart() : printed}` || '(the program returned nothing)'
+  if (Buffer.byteLength(text, 'utf8') > HARD_AGY_MCP_INLINE_CAP_BYTES) {
+    if (!isSpilled) writeFileSync(spillPath, whole, 'utf8')
+    isSpilled = true
+    text = clip(text, budgetChars)
+  }
+  if (isSpilled) {
+    text += `\n[fabric: clipped to ~${Math.round(budgetChars / 4)} tokens; full output saved at ${spillPath}]`
+  }
+  return { text, isError: false, isOk, failure, before, logs, wholeValue, wholeBytes, offloaded: isSpilled }
+}
 
 const executeFabricProgram = async rawInput => {
   const input = record(rawInput)
@@ -1627,7 +2139,16 @@ const executeFabricProgram = async rawInput => {
   const stateDir = workspaceStateDir(cwd)
   const cfg = loadFabricConfig(cwd)
   const reqTimeout = Number(input.timeoutMs ?? input.timeout_ms)
-  const timeoutMs = Number.isFinite(reqTimeout) && reqTimeout > 0 ? Math.min(reqTimeout, 600000) : cfg.timeoutMs
+  const timeoutMs = Number.isFinite(reqTimeout) && reqTimeout > 0 ? Math.min(reqTimeout, MAX_PROGRAM_TIMEOUT_MS) : cfg.timeoutMs
+  const rawReqYield = input.yieldMs ?? input.yield_ms ?? input.autoYieldMs
+  const effectiveYieldMs =
+    rawReqYield !== undefined && rawReqYield !== null && Number.isFinite(Number(rawReqYield))
+      ? Number(rawReqYield) <= 0
+        ? 0
+        : Math.min(Math.floor(Number(rawReqYield)), timeoutMs)
+      : cfg.yieldMs > 0
+        ? Math.min(cfg.yieldMs, timeoutMs)
+        : 0
   const reqTokens = Number(input.maxOutputTokens ?? input.max_output_tokens)
   const isBudgetSet = Number.isFinite(reqTokens) && reqTokens > 0
   const budgetChars = isBudgetSet
@@ -1651,22 +2172,75 @@ const executeFabricProgram = async rawInput => {
   const skillsList = discoverSkills(cwd).map(({ name, description, source }) => ({ name, description, source }))
   const worker = await acquireWorker(cwd)
 
+  const startedAt = Date.now()
+  const hardDeadlineMs = startedAt + timeoutMs
+  const yieldDeadlineMs = effectiveYieldMs > 0 && effectiveYieldMs < timeoutMs ? startedAt + effectiveYieldMs : null
+  const abortController = new AbortController()
+
   const runHandle = runTracker.startRun({ id, cwd, code, display: record(input.display) })
   const served = []
   const pending = new Set()
   const stray = []
+  const activeCalls = new Map()
+  const liveLogs = []
   let done = undefined
   let stopped = undefined
+  let wasManuallyStopped = false
   let exitReason = 'the kernel exited without a result'
 
-  const dispatchHostCall = async (op, args) => {
-    if (op === 'pi') return execPi(cwd, timeoutMs, args.method, args.args)
+  let resolveTaskDone
+  const taskDonePromise = new Promise(r => {
+    resolveTaskDone = r
+  })
+
+  const runCtx = {
+    id,
+    kind: 'exec',
+    name: runHandle?.run?.name || 'fabric_exec',
+    description: runHandle?.run?.description || '',
+    cwd,
+    startedAt,
+    finishedAt: null,
+    status: 'running',
+    ok: null,
+    yielded: false,
+    activeCalls,
+    served,
+    liveLogs,
+    hasValue: false,
+    rawValue: null,
+    logs: [],
+    failure: '',
+    before: '',
+    formattedText: '',
+    offloaded: false,
+    donePromise: taskDonePromise,
+    async stop() {
+      if (runCtx.status !== 'running') return
+      wasManuallyStopped = true
+      stopped ??= 'cancelled via tasks.stop'
+      abortController.abort()
+      worker.destroy('SIGTERM')
+      await Promise.race([taskDonePromise, new Promise(r => setTimeout(r, 2000))])
+    },
+  }
+
+  const dispatchHostCall = async (op, args, callExecCtx) => {
+    if (op === 'pi') return execPi(cwd, timeoutMs, args.method, args.args, callExecCtx)
     if (op === 'skill') return loadSkillText(cwd, args.name)
-    if (op === 'agent') return runAgySubagent(cwd, cfg, record(args))
+    if (op === 'agent') return runAgySubagent(cwd, cfg, record(args), callExecCtx)
     if (op === 'mcp') return callExternalMcp(record(args))
     if (op === 'tools') return handleToolsOp(cwd, sessionId, record(args))
     if (op === 'compact') return handleCompactOp(cwd, cfg, sessionMeta, record(args))
     if (op === 'memory') return expandTranscriptMemory(cwd, record(args?.options), sessionMeta)
+    if (op === 'tasks') {
+      return handleTasksOp(record(args), {
+        runId: id,
+        yieldDeadlineMs: runCtx.yielded ? null : yieldDeadlineMs,
+        hardDeadlineMs,
+        signal: abortController.signal,
+      })
+    }
     if (op === 'ce_cmd') {
       if (!ceEntry) throw new Error('pi-context-engineer is unavailable')
       return ceEntry.host.ops.command({ name: 'ce', args: String(args?.args ?? 'status') })
@@ -1709,177 +2283,203 @@ const executeFabricProgram = async rawInput => {
             ? `mcp.${call.args?.server}.${call.args?.tool}`
             : call.op === 'compact'
               ? `compact.${call.args?.action}`
-              : call.op
-    const callEntry = runTracker.startCall(runHandle, call.op, call.args, cwd)
+              : call.op === 'tasks'
+                ? `tasks.${call.args?.action}`
+                : call.op
+    const info = describeHostCall(call.op, call.args, cwd)
+    const activeEntry =
+      call.op !== 'state'
+        ? { ref, label: info.label || '', startedAt: Date.now(), outputTail: '' }
+        : null
+    if (activeEntry) activeCalls.set(call.id, activeEntry)
+
+    const callEntry = !runCtx.yielded ? runTracker.startCall(runHandle, call.op, call.args, cwd) : null
+    const callExecCtx = {
+      signal: abortController.signal,
+      onOutput: activeEntry
+        ? chunk => {
+            activeEntry.outputTail = appendRollingTail(activeEntry.outputTail, chunk, 4096)
+          }
+        : undefined,
+    }
+
     let answer
     try {
-      const value = await dispatchHostCall(call.op, call.args)
+      const value = await dispatchHostCall(call.op, call.args, callExecCtx)
       answer = { ok: true, value: value === undefined ? null : value }
     } catch (err) {
       answer = { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
-    runTracker.finishCall(runHandle, callEntry, answer.ok)
+    if (activeEntry) activeCalls.delete(call.id)
+    if (!runCtx.yielded && callEntry) runTracker.finishCall(runHandle, callEntry, answer.ok)
     if (call.op !== 'state') served.push({ ref, isOk: answer.ok })
     try {
       if (worker.alive) worker.send({ t: 'res', id: call.id, answer })
     } catch {}
   }
 
-  await new Promise(resolveRun => {
-    let settled = false
-    const finish = () => {
-      if (settled) return
-      settled = true
-      resolveRun()
-    }
+  const workerExecutionPromise = (async () => {
+    await new Promise(resolveRun => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        resolveRun()
+      }
 
-    const timer = setTimeout(() => {
-      stopped ??= `timed out after ${timeoutMs} ms`
-      worker.destroy('SIGTERM')
-      finish()
-    }, timeoutMs)
+      const timer = setTimeout(() => {
+        stopped ??= `timed out after ${timeoutMs} ms`
+        abortController.abort()
+        worker.destroy('SIGTERM')
+        finish()
+      }, timeoutMs)
 
-    worker.activeRun = {
-      onStray: line => stray.push(line),
-      onMessage: msg => {
-        if (msg.t === 'done' && msg.runId === id) {
-          done = msg
+      worker.activeRun = {
+        onStray: line => stray.push(line),
+        onMessage: msg => {
+          if (msg.t === 'log' && msg.runId === id) {
+            if (typeof msg.line === 'string') {
+              liveLogs.push(msg.line)
+              if (liveLogs.length > 200) liveLogs.shift()
+            }
+            return
+          }
+          if (msg.t === 'done' && msg.runId === id) {
+            done = msg
+            clearTimeout(timer)
+            finish()
+            return
+          }
+          if (msg.t === 'call') {
+            const job = serve(msg).catch(() => undefined)
+            pending.add(job)
+            job.finally(() => pending.delete(job))
+          }
+        },
+        onExit: reason => {
+          exitReason = reason
           clearTimeout(timer)
           finish()
-          return
-        }
-        if (msg.t === 'call') {
-          const job = serve(msg).catch(() => undefined)
-          pending.add(job)
-          job.finally(() => pending.delete(job))
-        }
-      },
-      onExit: reason => {
-        exitReason = reason
+        },
+      }
+
+      try {
+        worker.send({
+          t: 'run',
+          runId: id,
+          programPath,
+          cwd,
+          payloads: parsePayloads(input.payloads ?? input.strings),
+          skills: skillsList,
+          agents: [{ name: 'fabric', ...(cfg.defaultSubagentModel ? { defaultModel: cfg.defaultSubagentModel } : {}) }],
+          stateDir,
+          headerLines: PROGRAM_HEADER_LINES,
+        })
+      } catch (err) {
+        exitReason = `the kernel could not run: ${err instanceof Error ? err.message : String(err)}`
         clearTimeout(timer)
+        worker.destroy()
         finish()
-      },
-    }
+      }
+    })
 
-    try {
-      worker.send({
-        t: 'run',
-        runId: id,
-        programPath,
-        cwd,
-        payloads: parsePayloads(input.payloads ?? input.strings),
-        skills: skillsList,
-        agents: [{ name: 'fabric', ...(cfg.defaultSubagentModel ? { defaultModel: cfg.defaultSubagentModel } : {}) }],
-        stateDir,
-        headerLines: PROGRAM_HEADER_LINES,
-      })
-    } catch (err) {
-      exitReason = `the kernel could not run: ${err instanceof Error ? err.message : String(err)}`
-      clearTimeout(timer)
+    const workerStderr = worker.stderr
+    if (stopped === undefined && done !== undefined && worker.alive) {
+      releaseWorker(worker, cwd)
+    } else {
       worker.destroy()
-      finish()
+      ensurePrewarmedWorker(cwd)
     }
-  })
 
-  const workerStderr = worker.stderr
-  if (stopped === undefined && done !== undefined && worker.alive) {
-    releaseWorker(worker, cwd)
-  } else {
-    worker.destroy()
-    ensurePrewarmedWorker(cwd)
-  }
+    await Promise.allSettled([...pending])
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {}
 
-  await Promise.allSettled([...pending])
-  try {
-    rmSync(dir, { recursive: true, force: true })
-  } catch {}
-
-  const logs = [...(done?.logs ?? []), ...stray]
-  const allLogs = logs.join('\n')
-  const allPrinted = logs.length > 0 ? `\n--- print ---\n${allLogs}` : ''
-  const indent = resultFormat === 'text' ? 0 : 2
-  const isOk = stopped === undefined && done?.ok === true
-
-  let failure = ''
-  let before = ''
-  if (!isOk) {
-    failure = stopped ?? done?.error ?? `${exitReason}${workerStderr.trim() ? `\n${workerStderr.trim()}` : ''}`
-    before =
-      served.length === 0
-        ? 'No host call had run.'
-        : `Host calls already made (${served.length}, effects stand): ${served.map(s => `${s.ref}${s.isOk ? '' : ' (failed)'}`).join(', ')}.`
-  }
-
-  const wholeValue = isOk && done?.hasValue ? textOf(done.value, indent) : ''
-  const whole = isOk
-    ? `${wholeValue}${wholeValue === '' ? allPrinted.trimStart() : allPrinted}` || '(the program returned nothing)'
-    : `fabric_exec error: ${failure}\n${before}${allPrinted}`
-
-  runTracker.finishRun(runHandle, { ok: isOk, error: isOk ? null : failure, preview: isOk ? wholeValue.slice(0, 120) : '' })
-  const wholeBytes = Buffer.byteLength(whole, 'utf8')
-
-  // 1. Hand whole result to pi-context-engineer (handles >=16 KB offloads, >=4 KB error compaction, turn budgets)
-  if (ceEntry) {
-    const ceInput = {
+    const formatted = await formatCompletedExecOutput({
+      id,
+      cwd,
       code,
-      ...(isBudgetSet ? { maxOutputTokens: Math.floor(budgetChars / 4) } : {}),
-    }
-    const controlled = await ceEntry.host.ops
-      .result({
-        toolCallId: `fabric-${id}`,
-        input: ceInput,
-        isError: !isOk,
-        text: whole,
-      })
-      .catch(() => null)
-    if (controlled && typeof controlled.text === 'string' && controlled.text.trim() !== '') {
-      return { text: controlled.text, isError: !isOk }
-    }
-    // 2. Eliminate Antigravity's 10-16 KB `steps/<N>/output.txt` dead zone:
-    //    if CE kept a medium result inline (>8.5 KB), store it in `.pi/context-store` with a preview + handle.
-    if (isOk && wholeBytes > budgetChars) {
-      const hint = String(input.display?.name || code).slice(0, 36)
-      const offloaded = await offloadToContextStore(cwd, `fabric-exec-${hint}`, 'fabric_exec', whole).catch(() => null)
-      if (offloaded) {
-        return { text: offloaded.text, isError: false }
+      input,
+      ceEntry,
+      isBudgetSet,
+      budgetChars,
+      resultFormat,
+      done,
+      stopped,
+      exitReason,
+      workerStderr,
+      served,
+      stray,
+    })
+
+    runCtx.finishedAt = Date.now()
+    runCtx.ok = formatted.isOk
+    runCtx.status = wasManuallyStopped ? 'stopped' : formatted.isOk ? 'done' : 'failed'
+    runCtx.hasValue = Boolean(formatted.isOk && done?.hasValue)
+    runCtx.rawValue = formatted.isOk && done?.hasValue ? done.value : null
+    runCtx.logs = formatted.logs
+    runCtx.failure = formatted.failure
+    runCtx.before = formatted.before
+    runCtx.formattedText = formatted.text
+    runCtx.offloaded = Boolean(formatted.offloaded)
+    resolveTaskDone(formatted)
+    if (runCtx.yielded) pruneTaskRegistry()
+    return formatted
+  })()
+
+  if (yieldDeadlineMs !== null) {
+    let yieldTimer = null
+    const raceWinner = await Promise.race([
+      workerExecutionPromise.then(formatted => ({ kind: 'completed', formatted })),
+      new Promise(resolveYield => {
+        yieldTimer = setTimeout(() => resolveYield({ kind: 'yielded' }), effectiveYieldMs)
+      }),
+    ])
+    if (yieldTimer) clearTimeout(yieldTimer)
+
+    if (raceWinner.kind === 'yielded' && runCtx.status === 'running') {
+      runCtx.yielded = true
+      taskRegistry.set(id, runCtx)
+      pruneTaskRegistry()
+      ensurePrewarmedWorker(cwd)
+      runTracker.finishRun(runHandle, { ok: true, error: null, preview: `auto-yielded → task ${id}` })
+
+      const snap = snapshotTask(runCtx, { includeResult: false, tailChars: 2000 })
+      const yieldEnvelope = {
+        yielded: true,
+        status: 'running',
+        taskId: id,
+        name: runCtx.name,
+        elapsedMs: snap.elapsedMs,
+        activeOps: snap.activeOps,
+        completedOps: snap.completedOps,
+        ...(snap.logsSoFar ? { logsSoFar: snap.logsSoFar } : {}),
+        ...(snap.outputTail ? { outputTail: snap.outputTail } : {}),
+        nextStep: `Program continues running in background as task "${id}". Do independent work if any, or call \`return await tasks.wait("${id}")\` in fabric_exec to wait for the next slice and collect its result (or \`await tasks.stop("${id}")\` to cancel).`,
+      }
+      return {
+        text: JSON.stringify(yieldEnvelope, null, resultFormat === 'text' ? 0 : 2),
+        isError: false,
       }
     }
-    if (wholeBytes <= budgetChars || (!isOk && wholeBytes <= HARD_AGY_MCP_INLINE_CAP_BYTES)) {
-      return { text: whole, isError: !isOk }
-    }
-  } else if (isOk && wholeBytes > budgetChars) {
-    const hint = String(input.display?.name || code).slice(0, 36)
-    const offloaded = await offloadToContextStore(cwd, `fabric-exec-${hint}`, 'fabric_exec', whole).catch(() => null)
-    if (offloaded) {
-      return { text: offloaded.text, isError: false }
-    }
+
+    const formatted = raceWinner.kind === 'completed' ? raceWinner.formatted : await workerExecutionPromise
+    runTracker.finishRun(runHandle, {
+      ok: formatted.isOk,
+      error: formatted.isOk ? null : formatted.failure,
+      preview: formatted.isOk ? formatted.wholeValue.slice(0, 120) : '',
+    })
+    return { text: formatted.text, isError: formatted.isError }
   }
 
-  // 3. Fallback structural fitting if ContextStore is unavailable
-  const shownLogs = clip(allLogs, Math.max(1000, Math.floor(budgetChars / 4)))
-  const printed = logs.length > 0 ? `\n--- print ---\n${shownLogs}` : ''
-  if (!isOk) {
-    return { text: clip(`fabric_exec error: ${failure}\n${before}${printed}`, HARD_AGY_MCP_INLINE_CAP_BYTES), isError: true }
-  }
-  const spillPath = join(SPILL_DIR, `${id}.txt`)
-  let isSpilled = false
-  const fitted = done?.hasValue
-    ? fit(done.value, Math.max(1000, budgetChars - printed.length), indent)
-    : { text: '', full: '', isClipped: false }
-  if (fitted.isClipped || shownLogs !== allLogs) {
-    isSpilled = true
-    writeFileSync(spillPath, whole, 'utf8')
-  }
-  let text = `${fitted.text}${fitted.text === '' ? printed.trimStart() : printed}` || '(the program returned nothing)'
-  if (Buffer.byteLength(text, 'utf8') > HARD_AGY_MCP_INLINE_CAP_BYTES) {
-    if (!isSpilled) writeFileSync(spillPath, whole, 'utf8')
-    isSpilled = true
-    text = clip(text, budgetChars)
-  }
-  if (isSpilled) {
-    text += `\n[fabric: clipped to ~${Math.round(budgetChars / 4)} tokens; full output saved at ${spillPath}]`
-  }
-  return { text, isError: false }
+  const formatted = await workerExecutionPromise
+  runTracker.finishRun(runHandle, {
+    ok: formatted.isOk,
+    error: formatted.isOk ? null : formatted.failure,
+    preview: formatted.isOk ? formatted.wholeValue.slice(0, 120) : '',
+  })
+  return { text: formatted.text, isError: formatted.isError }
 }
 
 // --- MCP Tool Schema -------------------------------------------------------
@@ -1887,14 +2487,14 @@ const executeFabricProgram = async rawInput => {
 const FABRIC_TOOL_SPEC = {
   name: 'fabric_exec',
   description:
-    'Execute one sandboxed TypeScript program (`await` + `return` at top level) composing: `pi.*` (read, write, edit, grep, find, ls, bash), `extensions.fovea_*` (fovea_sketch, fovea_focus, fovea_dwell, fovea_impact), `extensions.ctx_*` (Context Engineer ctx_read, ctx_summarize, ctx_offload), `compact.*` & `memory.expand` (deterministic LLM-free compaction & lossless transcript recall), `mcp.<server>.<tool>(args)`, `skills.list/load`, `state.get/set`, and `agents.run` (`agy` subagents). Outputs >8.5 KB automatically offload to `.pi/context-store` with a handle + structural outline.',
+    'Execute one sandboxed TypeScript program (`await` + `return` at top level) composing: `pi.*` (read, write, edit, grep, find, ls, bash), `extensions.fovea_*` (fovea_sketch, fovea_focus, fovea_dwell, fovea_impact), `extensions.ctx_*` (Context Engineer ctx_read, ctx_summarize, ctx_offload), `compact.*` & `memory.expand` (deterministic LLM-free compaction & lossless transcript recall), `tasks.*` (list, get, wait, stop for auto-yielded programs & background bash), `mcp.<server>.<tool>(args)`, `skills.list/load`, `state.get/set`, and `agents.run` (`agy` subagents). Programs running past `yieldMs` (default 95s) auto-yield to background with a `taskId` instead of blocking or losing KV cache TTL; Outputs >8.5 KB automatically offload to `.pi/context-store` with a handle + structural outline.',
   inputSchema: {
     type: 'object',
     properties: {
       code: {
         type: 'string',
         description:
-          'Async TypeScript function body. Globals: `pi`, `extensions` (`fovea_*`, `ctx_*`), `fovea`, `ce`, `compact`, `memory`, `mcp`, `tools`, `skills`, `agents`, `state`, `clip`, `print`, `π`. Return one compact JSON-serializable value or string.',
+          'Async TypeScript function body. Globals: `pi`, `extensions` (`fovea_*`, `ctx_*`), `fovea`, `ce`, `compact`, `memory`, `tasks` (alias `bg`), `mcp`, `tools`, `skills`, `agents`, `state`, `clip`, `print`, `π`. Return one compact JSON-serializable value or string.',
       },
       display: {
         type: 'object',
@@ -1919,7 +2519,12 @@ const FABRIC_TOOL_SPEC = {
       },
       timeoutMs: {
         type: 'number',
-        description: 'Optional program deadline in ms (up to 600000).',
+        description: 'Optional hard program deadline in ms (default 600000 / 10m, max 1800000 / 30m).',
+      },
+      yieldMs: {
+        type: 'number',
+        description:
+          'Optional auto-yield threshold in ms (default 95000). If the program is still running at `yieldMs`, `fabric_exec` returns `{ yielded: true, taskId }` while the worker continues in the background (collect via `await tasks.wait(taskId)`). Pass `0` to disable auto-yield.',
       },
       maxOutputTokens: {
         type: 'number',
@@ -1975,6 +2580,12 @@ let clientSupportsRoots = false
 
 const shutdownAll = async () => {
   if (idleWorker) idleWorker.destroy()
+  const stopJobs = []
+  for (const task of taskRegistry.values()) {
+    if (task.kind === 'exec' && task.status === 'running') {
+      stopJobs.push(task.stop().catch(() => undefined))
+    }
+  }
   for (const client of mcpClients.values()) {
     try {
       client.close?.()
@@ -1984,7 +2595,7 @@ const shutdownAll = async () => {
   const jobs = []
   for (const { host } of ceHostsByCwd.values()) jobs.push(host.ops.shutdown().catch(() => undefined))
   for (const host of foveaHostsByCwd.values()) jobs.push(host.ops.shutdown().catch(() => undefined))
-  await Promise.allSettled(jobs)
+  await Promise.allSettled([...stopJobs, ...jobs])
 }
 
 process.once('SIGTERM', () => void shutdownAll().finally(() => process.exit(0)))

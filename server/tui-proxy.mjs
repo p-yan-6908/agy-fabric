@@ -28,7 +28,7 @@ const MUTED = '\x1b[38;5;245m'
 const SYNC_START = '\x1b[?2026h'
 const SYNC_END = '\x1b[?2026l'
 
-const KIND_ORDER = ['read', 'edit', 'write', 'search', 'list', 'bash', 'fovea', 'ctx', 'agent', 'mcp', 'skill', 'compact', 'memory', 'tool']
+const KIND_ORDER = ['read', 'edit', 'write', 'search', 'list', 'bash', 'fovea', 'ctx', 'agent', 'task', 'mcp', 'skill', 'compact', 'memory', 'tool']
 const KIND_LABEL = {
   read: 'Read',
   edit: 'Edit',
@@ -41,6 +41,7 @@ const KIND_LABEL = {
   agent: 'Agent',
   mcp: 'MCP',
   skill: 'Skill',
+  task: 'Task',
   compact: 'Compact',
   memory: 'Recall',
   tool: 'Op',
